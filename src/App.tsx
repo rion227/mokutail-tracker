@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 // 共有同期対応版（Supabase optional）
 // - ローカル保存 + 任意で Supabase を使った端末間同期（同じ Room ID で共有）
 // - Room に接続すると、在庫/基準/カウントをクラウドへ保存し、他端末とリアルタイム同期
@@ -40,6 +40,11 @@ const INITIAL_INVENTORY = {
   soda_tropical: 3350,
   peach_pieces: 40,
 };
+
+// 型エイリアス（TS CI 対策）
+type Inventory = typeof INITIAL_INVENTORY;
+type Counts = Record<string, number>;
+type Baseline = typeof INITIAL_INVENTORY;
 
 // ==== レシピ（ml / 個）====
 const RECIPES: Record<string, Record<string, number>> = {
@@ -89,15 +94,15 @@ try {
 
 export default function App() {
   // ---- state ----
-  const [inventory, setInventory] = useState(() => {
+  const [inventory, setInventory] = useState<Inventory>(() => {
     try { const raw = localStorage.getItem(LS_INV); return raw ? JSON.parse(raw) : INITIAL_INVENTORY; } catch { return INITIAL_INVENTORY; }
   });
-  const [baseline, setBaseline] = useState(() => {
+  const [baseline, setBaseline] = useState<Baseline>(() => {
     try { const raw = localStorage.getItem(LS_BASE); return raw ? JSON.parse(raw) : INITIAL_INVENTORY; } catch { return INITIAL_INVENTORY; }
   });
-  const [counts, setCounts] = useState(() => {
+  const [counts, setCounts] = useState<Counts>(() => {
     try { const raw = localStorage.getItem(LS_COUNTS); if (raw) return JSON.parse(raw); } catch {}
-    const o: Record<string, number> = {}; Object.keys(RECIPES).forEach((k) => (o[k] = 0)); return o;
+    const o: Counts = {}; (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0)); return o;
   });
   const [editMode, setEditMode] = useState(false);
 
@@ -117,35 +122,33 @@ export default function App() {
   useEffect(() => { localStorage.setItem(LS_SYNC, JSON.stringify({ url: sbUrl, key: sbKey, room: roomId })); }, [sbUrl, sbKey, roomId]);
 
   // ---- helpers ----
-  const canMakeWith = (inv: typeof INITIAL_INVENTORY, recipeKey: string) => {
+  const canMakeWith = (inv: Inventory, recipeKey: string) => {
     const recipe = RECIPES[recipeKey];
     const blockers: string[] = [];
     for (const k in recipe) {
       const need = recipe[k];
-      // @ts-ignore
-      const have = inv[k] as number;
+      const have = inv[k as keyof Inventory] as number;
       if (have < need) blockers.push(NICE_LABEL[k] || k);
     }
     return { ok: blockers.length === 0, blockers };
   };
   const canMake = (recipeKey: string) => canMakeWith(inventory, recipeKey);
 
-  const servingsLeftWith = (inv: typeof INITIAL_INVENTORY, recipeKey: string) => {
+  const servingsLeftWith = (inv: Inventory, recipeKey: string) => {
     const recipe = RECIPES[recipeKey];
     let min = Infinity;
     for (const k in recipe) {
       const need = recipe[k];
-      // @ts-ignore
-      const have = inv[k] as number;
+      const have = inv[k as keyof Inventory] as number;
       const left = Math.floor(have / need);
       if (left < min) min = left;
     }
     return isFinite(min) ? min : 0;
   };
-  const servingsLeft = (recipeKey: string) => servingsLeftWith(inventory, recipeKey);
+  //const servingsLeft = (recipeKey: string) => servingsLeftWith(inventory, recipeKey);
 
-  const updateBaselineIfIncreased = (key: keyof typeof INITIAL_INVENTORY, nextVal: number) => {
-    setBaseline((prev) => ({ ...prev, [key]: Math.max((prev as any)[key] ?? 0, nextVal) } as any));
+  const updateBaselineIfIncreased = (key: keyof Inventory, nextVal: number) => {
+    setBaseline((prev: Baseline) => ({ ...prev, [key]: Math.max((prev as any)[key] ?? 0, nextVal) } as Baseline));
   };
 
   // ---- actions ----
@@ -153,20 +156,20 @@ export default function App() {
     const check = canMake(recipeKey);
     if (!check.ok) return;
     const recipe = RECIPES[recipeKey];
-    setInventory((prev) => {
-      const next: any = { ...prev };
-      for (const k in recipe) next[k] = Math.max(0, (next[k] as number) - recipe[k]);
+    setInventory((prev: Inventory) => {
+      const next: Inventory = { ...prev } as Inventory;
+      for (const k in recipe) (next as any)[k] = Math.max(0, (next as any)[k] as number - recipe[k]);
       return next;
     });
-    setCounts((prev) => ({ ...prev, [recipeKey]: (prev[recipeKey] || 0) + 1 }));
+    setCounts((prev: Counts) => ({ ...prev, [recipeKey]: (prev[recipeKey] || 0) + 1 }));
   };
 
   const undoOne = (recipeKey: string) => {
-    setCounts((prev) => { const cur = prev[recipeKey] || 0; if (cur <= 0) return prev; return { ...prev, [recipeKey]: cur - 1 }; });
+    setCounts((prev: Counts) => { const cur = prev[recipeKey] || 0; if (cur <= 0) return prev; return { ...prev, [recipeKey]: cur - 1 }; });
     const recipe = RECIPES[recipeKey];
-    setInventory((prev) => {
-      const next: any = { ...prev };
-      for (const k in recipe) next[k] = Math.max(0, (next[k] as number) + recipe[k]);
+    setInventory((prev: Inventory) => {
+      const next: Inventory = { ...prev } as Inventory;
+      for (const k in recipe) (next as any)[k] = Math.max(0, (next as any)[k] as number + recipe[k]);
       return next;
     });
   };
@@ -174,28 +177,31 @@ export default function App() {
   const resetAll = () => {
     setInventory(INITIAL_INVENTORY);
     setBaseline(INITIAL_INVENTORY);
-    const o: Record<string, number> = {}; Object.keys(RECIPES).forEach((k) => (o[k] = 0)); setCounts(o);
+    const o: Counts = {}; (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0)); setCounts(o);
   };
 
   // 在庫手動編集（この操作で 100% 基準更新）
-  const setInventoryValue = (key: keyof typeof INITIAL_INVENTORY, value: number) => {
+  const setInventoryValue = (key: keyof Inventory, value: number) => {
     const v = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
-    setInventory((prev) => ({ ...prev, [key]: v }));
+    setInventory((prev: Inventory) => ({ ...prev, [key]: v } as Inventory));
     updateBaselineIfIncreased(key, v);
   };
-  const bumpInventory = (key: keyof typeof INITIAL_INVENTORY, delta: number) => {
-    setInventory((prev) => {
+  const bumpInventory = (key: keyof Inventory, delta: number) => {
+    setInventory((prev: Inventory) => {
       const nextVal = Math.max(0, (prev[key] as number) + delta);
-      const next = { ...prev, [key]: nextVal } as any;
+      const next: Inventory = { ...prev, [key]: nextVal } as Inventory;
       updateBaselineIfIncreased(key, nextVal);
       return next;
     });
   };
 
   // ---- derived ----
-  const inventoryList = useMemo(() => Object.entries(inventory).map(([k, v]) => ({ key: k, label: NICE_LABEL[k as keyof typeof NICE_LABEL] || k, value: v })), [inventory]);
+  const inventoryList = useMemo<{ key: string; label: string; value: number }[]>(
+    () => Object.entries(inventory).map(([k, v]) => ({ key: k, label: NICE_LABEL[k as keyof typeof NICE_LABEL] || k, value: v as number })),
+    [inventory]
+  );
 
-  const getLevel = (key: keyof typeof INITIAL_INVENTORY, value: number) => {
+  const getLevel = (key: keyof Inventory, value: number) => {
     const base = (baseline as any)[key] as number | undefined;
     if (!Number.isFinite(base) || (base as number) <= 0) return "ok";
     const pct = value / (base as number);
@@ -206,13 +212,13 @@ export default function App() {
 
   const leftMap = useMemo(() => {
     const out: Record<string, number> = {};
-    for (const key of Object.keys(RECIPES)) out[key] = servingsLeftWith(inventory as any, key);
+    for (const key of (Object.keys(RECIPES) as string[])) out[key] = servingsLeftWith(inventory as Inventory, key);
     return out;
   }, [inventory]);
 
   const perCupCost = useMemo(() => {
     const map: Record<string, number> = {};
-    for (const key of Object.keys(RECIPES)) {
+    for (const key of (Object.keys(RECIPES) as string[])) {
       const recipe = RECIPES[key]; let cost = 0;
       for (const mat in recipe) {
         const amt = recipe[mat];
@@ -231,8 +237,8 @@ export default function App() {
 
   // ====== Supabase 同期 ======
   const connectSupabase = async () => {
-    if (!createClient) { alert('supabase-js が見つかりません。\n`npm i @supabase/supabase-js` を実行してください。'); return; }
-    if (!sbUrl || !sbKey || !roomId) { alert('Supabase URL / anon key / Room ID を入力してください'); return; }
+   if (!createClient) { alert(`supabase-js が見つかりません。\nnpm i @supabase/supabase-js を実行してください。`); return; }
+   if (!sbUrl || !sbKey || !roomId) { alert('Supabase URL / anon key / Room ID を入力してください'); return; }
     const sb = createClient(sbUrl, sbKey);
     supabaseRef.current = sb;
     setConnected(true);
@@ -301,10 +307,10 @@ export default function App() {
     eq("モヒート甘め max", servingsLeftWith(INITIAL_INVENTORY as any, "パインモヒート / 甘め"), 35);
     eq("トロピカルすっきり max", servingsLeftWith(INITIAL_INVENTORY as any, "トロピカルスカッシュ / すっきり"), 30);
     const invNoPeach = { ...INITIAL_INVENTORY, peach_pieces: 0 } as typeof INITIAL_INVENTORY;
-    const checkPeach = canMakeWith(invNoPeach, "白桃スカッシュ / さっぱり");
+    const checkPeach = canMakeWith(invNoPeach as Inventory, "白桃スカッシュ / さっぱり");
     eq("白桃トッピング不足検出", checkPeach.ok, false);
-    const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY; eq("トロピカル 1杯", servingsLeftWith(invFewSoda, "トロピカルスカッシュ / すっきり"), 1);
-    const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY; eq("トロピカル 2杯", servingsLeftWith(invMoreSoda, "トロピカルスカッシュ / すっきり"), 2);
+    const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY; eq("トロピカル 1杯", servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"), 1);
+    const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY; eq("トロピカル 2杯", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
     // eslint-disable-next-line no-console
     console.table(results);
   }, []);
@@ -351,7 +357,7 @@ export default function App() {
 
         {/* バリエーション一覧 */}
         <section className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {Object.keys(RECIPES).map((key) => {
+          {(Object.keys(RECIPES) as string[]).map((key) => {
             const { ok, blockers } = canMake(key);
             const left = leftMap[key];
             return (
@@ -365,7 +371,7 @@ export default function App() {
                 <div className="text-xs bg-neutral-50 rounded-xl p-3">
                   <p className="text-neutral-500 mb-1">1杯あたりの使用量</p>
                   <ul className="grid grid-cols-2 gap-1">
-                    {Object.entries(RECIPES[key]).map(([ik, amount]) => (
+                    {(Object.entries(RECIPES[key]) as [string, number][])?.map(([ik, amount]) => (
                       <li key={ik} className="flex items-center justify-between">
                         <span>{NICE_LABEL[ik as keyof typeof NICE_LABEL] || ik}</span>
                         <span className="font-mono">{amount}{ik === "peach_pieces" ? "個" : "ml"}</span>
@@ -392,7 +398,7 @@ export default function App() {
           <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3">
             {inventoryList.map(({ key, label, value }) => {
               const isPieces = key === "peach_pieces";
-              const level = getLevel(key as any, value as number);
+              const level = getLevel(key as keyof Inventory, value as number);
               const base = (baseline as any)[key] ?? 0;
               const pct = base > 0 ? Math.min(1, Math.max(0, (value as number) / base)) : 1;
               const wrapCls = level === "danger" ? "border border-red-300 bg-red-50" : level === "warn" ? "border border-amber-300 bg-amber-50" : "border border-neutral-200 bg-white";
@@ -409,19 +415,19 @@ export default function App() {
                   )}
                   {editMode && (
                     <div className="flex items-center gap-2">
-                      <input type="number" inputMode="numeric" className="w-28 px-2 py-1 rounded border border-neutral-300 font-mono" value={value as number} onChange={(e) => setInventoryValue(key as any, Number(e.target.value))} />
+                      <input type="number" inputMode="numeric" className="w-28 px-2 py-1 rounded border border-neutral-300 font-mono" value={value as number} onChange={(e) => setInventoryValue(key as keyof Inventory, Number(e.target.value))} />
                       <div className="flex gap-1">
                         {isPieces ? (
                           <>
-                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as any, 1)}>+1</button>
-                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as any, 5)}>+5</button>
-                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as any, 10)}>+10</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 1)}>+1</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 5)}>+5</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 10)}>+10</button>
                           </>
                         ) : (
                           <>
-                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as any, 50)}>+50</button>
-                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as any, 100)}>+100</button>
-                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as any, 500)}>+500</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 50)}>+50</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 100)}>+100</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 500)}>+500</button>
                           </>
                         )}
                       </div>
