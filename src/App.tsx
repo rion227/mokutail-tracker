@@ -237,8 +237,9 @@ export default function App() {
 
   // ====== Supabase 同期 ======
   const connectSupabase = async () => {
-   if (!createClient) { alert(`supabase-js が見つかりません。\nnpm i @supabase/supabase-js を実行してください。`); return; }
-   if (!sbUrl || !sbKey || !roomId) { alert('Supabase URL / anon key / Room ID を入力してください'); return; }
+    if (!createClient) { alert(`supabase-js が見つかりません。
+npm i @supabase/supabase-js を実行してください。`); return; }
+    if (!sbUrl || !sbKey || !roomId) { alert('Supabase URL / anon key / Room ID を入力してください'); return; }
     const sb = createClient(sbUrl, sbKey);
     supabaseRef.current = sb;
     setConnected(true);
@@ -247,7 +248,6 @@ export default function App() {
     const payload = { inventory, baseline, counts, updated_at: new Date().toISOString() };
     const { data: got } = await sb.from('rooms').select('id,payload').eq('id', roomId).maybeSingle();
     if (got && got.payload) {
-      // 競合は updated_at で LWW（新しい方を採用）
       try {
         const remote = got.payload;
         const localTs = Date.parse(payload.updated_at);
@@ -266,21 +266,23 @@ export default function App() {
       await sb.from('rooms').upsert({ id: roomId, payload }, { onConflict: 'id' });
     }
 
-    // Realtime 購読
+    // Realtime 購読（INSERT/UPDATE の両方）
     if (subscriptionRef.current) sb.removeChannel(subscriptionRef.current);
+    const handler = (payloadEv: any) => {
+      try {
+        const remote = payloadEv?.new?.payload;
+        if (!remote) return;
+        if (pushingRef.current) return; // 自分が push した直後の反射をスキップ
+        setInventory(remote.inventory);
+        setBaseline(remote.baseline);
+        setCounts(remote.counts);
+      } catch {}
+    };
+
     const channel = sb
-      .channel('room-sync')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, (payloadEv: any) => {
-        try {
-          const remote = payloadEv?.new?.payload;
-          if (!remote) return;
-          // 自分が push した直後の反射をスキップ
-          if (pushingRef.current) return;
-          setInventory(remote.inventory);
-          setBaseline(remote.baseline);
-          setCounts(remote.counts);
-        } catch {}
-      })
+      .channel(`rooms:${roomId}`)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
       .subscribe();
     subscriptionRef.current = channel;
   };
@@ -298,6 +300,29 @@ export default function App() {
     push();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inventory, baseline, counts]);
+
+  // ★ Fallback: ポーリング（Realtime が届かない端末/回線向け）
+  useEffect(() => {
+    if (!connected || !supabaseRef.current || !roomId) return;
+    const sb = supabaseRef.current;
+    const id = setInterval(async () => {
+      try {
+        if (pushingRef.current) return; // 自分の更新直後はスキップ
+        const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
+        const remote = data?.payload;
+        if (!remote) return;
+        // 何か差があれば反映（updated_at の比較でもOK）
+        if (JSON.stringify(remote.inventory) !== JSON.stringify(inventory) ||
+            JSON.stringify(remote.counts) !== JSON.stringify(counts) ||
+            JSON.stringify(remote.baseline) !== JSON.stringify(baseline)) {
+          setInventory(remote.inventory);
+          setBaseline(remote.baseline);
+          setCounts(remote.counts);
+        }
+      } catch {}
+    }, 5000); // 5秒間隔
+    return () => clearInterval(id);
+  }, [connected, roomId, inventory, baseline, counts]);
 
   // ===== DEV: 簡易テスト =====
   useEffect(() => {
