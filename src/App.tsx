@@ -80,6 +80,7 @@ const LS_INV = "mt_inv";
 const LS_BASE = "mt_base"; // 残量バー基準
 const LS_COUNTS = "mt_counts";
 const LS_SYNC = "mt_sync"; // {url,key,room}
+const LS_VER = "mt_ver"; // 楽観的同期のためのバージョン番号
 
 // ====== Supabase (optional) ======
 // npm i @supabase/supabase-js
@@ -105,6 +106,10 @@ export default function App() {
     const o: Counts = {}; (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0)); return o;
   });
   const [editMode, setEditMode] = useState(false);
+  // 楽観的同期用のローカルバージョン
+  const [version, setVersion] = useState<number>(() => {
+    try { return Number(localStorage.getItem(LS_VER) || '0') || 0; } catch { return 0; }
+  });
 
   // Sync settings
   const [sbUrl, setSbUrl] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').url || ''; } catch { return ''; } });
@@ -119,6 +124,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem(LS_INV, JSON.stringify(inventory)); }, [inventory]);
   useEffect(() => { localStorage.setItem(LS_BASE, JSON.stringify(baseline)); }, [baseline]);
   useEffect(() => { localStorage.setItem(LS_COUNTS, JSON.stringify(counts)); }, [counts]);
+  useEffect(() => { localStorage.setItem(LS_VER, String(version)); }, [version]);
   useEffect(() => { localStorage.setItem(LS_SYNC, JSON.stringify({ url: sbUrl, key: sbKey, room: roomId })); }, [sbUrl, sbKey, roomId]);
 
   // ---- helpers ----
@@ -245,25 +251,25 @@ npm i @supabase/supabase-js を実行してください。`); return; }
     setConnected(true);
 
     // 初回 pull（存在すれば取得、なければ作成）
-    const payload = { inventory, baseline, counts, updated_at: new Date().toISOString() };
+    const basePayload = { inventory, baseline, counts, version, updated_at: new Date().toISOString() };
     const { data: got } = await sb.from('rooms').select('id,payload').eq('id', roomId).maybeSingle();
     if (got && got.payload) {
       try {
         const remote = got.payload;
-        const localTs = Date.parse(payload.updated_at);
-        const remoteTs = Date.parse(remote.updated_at || 0);
-        if (remoteTs > localTs) {
+        const remoteVer = Number(remote?.version || 0);
+        if (remoteVer > version) {
           pushingRef.current = true;
           setInventory(remote.inventory);
           setBaseline(remote.baseline);
           setCounts(remote.counts);
+          setVersion(remoteVer);
           setTimeout(() => { pushingRef.current = false; }, 50);
         } else {
-          await sb.from('rooms').upsert({ id: roomId, payload }, { onConflict: 'id' });
+          await sb.from('rooms').upsert({ id: roomId, payload: basePayload }, { onConflict: 'id' });
         }
       } catch {}
     } else {
-      await sb.from('rooms').upsert({ id: roomId, payload }, { onConflict: 'id' });
+      await sb.from('rooms').upsert({ id: roomId, payload: basePayload }, { onConflict: 'id' });
     }
 
     // Realtime 購読（INSERT/UPDATE の両方）
@@ -272,10 +278,13 @@ npm i @supabase/supabase-js を実行してください。`); return; }
       try {
         const remote = payloadEv?.new?.payload;
         if (!remote) return;
+        const remoteVer = Number(remote?.version || 0);
         if (pushingRef.current) return; // 自分が push した直後の反射をスキップ
+        if (remoteVer <= version) return; // 古い更新は無視
         setInventory(remote.inventory);
         setBaseline(remote.baseline);
         setCounts(remote.counts);
+        setVersion(remoteVer);
       } catch {}
     };
 
@@ -292,14 +301,37 @@ npm i @supabase/supabase-js を実行してください。`); return; }
     const push = async () => {
       if (!connected || !supabaseRef.current) return;
       const sb = supabaseRef.current;
-      const payload = { inventory, baseline, counts, updated_at: new Date().toISOString() };
+      const nextVersion = Number(version) + 1;
+      const payload = { inventory, baseline, counts, version: nextVersion, updated_at: new Date().toISOString() };
       pushingRef.current = true;
       await sb.from('rooms').upsert({ id: roomId, payload }, { onConflict: 'id' });
+      setVersion(nextVersion);
       setTimeout(() => { pushingRef.current = false; }, 50);
     };
     push();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inventory, baseline, counts]);
+
+  // ★ Fallback: ポーリング（Realtime が届かない端末/回線向け）
+  useEffect(() => {
+    if (!connected || !supabaseRef.current || !roomId) return;
+    const sb = supabaseRef.current;
+    const id = setInterval(async () => {
+      try {
+        if (pushingRef.current) return; // 自分の更新直後はスキップ
+        const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
+        const remote = data?.payload;
+        if (!remote) return;
+        const remoteVer = Number(remote?.version || 0);
+        if (remoteVer <= version) return; // 古い更新は反映しない
+        setInventory(remote.inventory);
+        setBaseline(remote.baseline);
+        setCounts(remote.counts);
+        setVersion(remoteVer);
+      } catch {}
+    }, 5000); // 5秒間隔
+    return () => clearInterval(id);
+  }, [connected, roomId, version]);
 
   // ★ Fallback: ポーリング（Realtime が届かない端末/回線向け）
   useEffect(() => {
