@@ -139,13 +139,18 @@ export default function App() {
   const supabaseRef = useRef<any>(null);
   const versionRef = useRef<number>(0);
   const subscriptionRef = useRef<any>(null);
-  const applyTimerRef = useRef<any>(null); // Realtime反映のデバウンス
-
+  const applyTimerRef = useRef<any>(null);
+  // --- push/apply guards ---
+  const remoteApplyingRef = useRef(false); // リモート適用中は push を抑止
+  const localDirtyRef = useRef(false);     // ローカル操作が入った時だけ push
+  
   // ---- lock control (reduce flicker) ----
   const LOCK_TTL_MS = 3000; // 他端末のロック有効時間（ms）
   const lockUntilRef = useRef<number>(0);
   const [lockActive, setLockActive] = useState(false);
   const lockTimerRef = useRef<any>(null);
+  const lastBusyOwnerRef = useRef<string | null>(null);
+  const lastBusyStartedRef = useRef<number>(0);
   const markLockedUntil = (until: number) => {
     lockUntilRef.current = until;
     setLockActive(true);
@@ -153,7 +158,7 @@ export default function App() {
     const delay = Math.max(0, until - Date.now());
     lockTimerRef.current = setTimeout(() => setLockActive(false), delay + 50);
   };
-  const actionsBlocked = () => pushingRef.current || lockActive;
+  const actionsBlocked = () => pushingRef.current || lockActive; // Realtime反映のデバウンス
 
   // === Sync overlay state ===
   const [syncBusy, setSyncBusy] = useState(false);
@@ -221,6 +226,7 @@ export default function App() {
 
   // ---- actions ----
   const makeOne = (recipeKey: string) => {
+    localDirtyRef.current = true;
     const check = canMake(recipeKey);
     if (!check.ok || actionsBlocked()) return;
     const recipe = RECIPES[recipeKey];
@@ -233,6 +239,7 @@ export default function App() {
   };
 
   const undoOne = (recipeKey: string) => {
+    localDirtyRef.current = true;
     if (actionsBlocked()) return;
     setCounts((prev: Counts) => { const cur = prev[recipeKey] || 0; if (cur <= 0) return prev; return { ...prev, [recipeKey]: cur - 1 }; });
     const recipe = RECIPES[recipeKey];
@@ -244,6 +251,7 @@ export default function App() {
   };
 
   const resetAll = () => {
+    localDirtyRef.current = true;
     if (actionsBlocked()) return;
     setInventory(INITIAL_INVENTORY);
     setBaseline(INITIAL_INVENTORY);
@@ -251,12 +259,14 @@ export default function App() {
   };
 
   const setInventoryValue = (key: keyof Inventory, value: number) => {
+    localDirtyRef.current = true;
     if (actionsBlocked()) return;
     const v = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
     setInventory((prev: Inventory) => ({ ...prev, [key]: v } as Inventory));
     updateBaselineIfIncreased(key, v);
   };
   const bumpInventory = (key: keyof Inventory, delta: number) => {
+    localDirtyRef.current = true;
     if (actionsBlocked()) return;
     setInventory((prev: Inventory) => {
       const nextVal = Math.max(0, (prev[key] as number) + delta);
@@ -381,8 +391,14 @@ export default function App() {
           const owner = remote?.sync?.owner;
           const started = Number(remote?.sync?.started_at || 0);
           if (busy && owner && owner !== clientId.current) {
-            const until = started + LOCK_TTL_MS;
-            if (until > Date.now()) markLockedUntil(until);
+            // 同じownerの古い busy 通知は無視してTTLを延長しすぎない
+            const isNewBusy = owner !== lastBusyOwnerRef.current || started > lastBusyStartedRef.current;
+            if (isNewBusy) {
+              lastBusyOwnerRef.current = owner;
+              lastBusyStartedRef.current = started;
+              const until = started + LOCK_TTL_MS;
+              if (until > Date.now()) markLockedUntil(until);
+            }
           }
 
           const remoteVer = Number(remote?.version || 0);
@@ -392,6 +408,8 @@ export default function App() {
           // ページリロードはせず、静かに適用（デバウンス）
           if (applyTimerRef.current) clearTimeout(applyTimerRef.current);
           applyTimerRef.current = setTimeout(() => {
+            // リモート適用フラグを立てて push を抑止
+            remoteApplyingRef.current = true;
             setInventory(remote.inventory);
             setBaseline(remote.baseline);
             setCounts(remote.counts);
@@ -421,6 +439,10 @@ export default function App() {
   useEffect(() => {
     const push = async () => {
       if (!connected || !supabaseRef.current || !roomId) return;
+      // リモート適用直後の反射は無視（ループ抑止）
+      if (remoteApplyingRef.current) { remoteApplyingRef.current = false; return; }
+      // ローカル操作が無いなら push しない（反映時の無限再送抑止）
+      if (!localDirtyRef.current) return;
 
       const sb = supabaseRef.current;
 
@@ -447,6 +469,7 @@ export default function App() {
       const finalPayload = buildPayload({ version: nextVersion, sync: { busy: false, owner: clientId.current, started_at: Date.now() } });
       await sb.from('rooms').upsert({ id: roomId, payload: finalPayload }, { onConflict: 'id' });
       setVersion(nextVersion);
+      localDirtyRef.current = false; // ローカル変更を消化
       setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
     };
     push();
