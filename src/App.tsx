@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 // - ローカル保存 + 任意で Supabase を使った端末間同期（同じ Room ID で共有）
 // - だれかが変更送信を開始したら、全端末で「同期中」表示になって操作を一時停止
 // - 最初に送信を“宣言”した端末が勝ち（soft lock）。完了でロック解除 → 全端末再開
+// - 追加: 自動再接続（LS_AUTOCONN）/ 他端末更新を**ページ再読込なし**で反映 / スクロール位置の保存復元（手動再読込時）
 
 // ==== 売価設定 ====
 const PRICE_PER_CUP = 300; // 円
@@ -35,7 +36,7 @@ const INITIAL_INVENTORY = {
   mojito: 700,
   cassis: 700,
   orange_juice: 3000,
-  soda_white: 5800, // 最新指定: 白桃 4000→+1000→+200? 等の会話調整はここで
+  soda_white: 5800,
   soda_mojito: 3850,
   soda_tropical: 3350,
   peach_pieces: 40,
@@ -81,7 +82,6 @@ const LS_COUNTS = "mt_counts";
 const LS_SYNC = "mt_sync";
 const LS_VER = "mt_ver";
 const LS_CLIENT = "mt_client";
-// NEW: 自動再接続フラグ
 const LS_AUTOCONN = "mt_autoconn"; // '1' で自動再接続
 
 // ====== Supabase (optional / lazy import) ======
@@ -139,6 +139,7 @@ export default function App() {
   const supabaseRef = useRef<any>(null);
   const versionRef = useRef<number>(0);
   const subscriptionRef = useRef<any>(null);
+  const applyTimerRef = useRef<any>(null); // Realtime反映のデバウンス
 
   // === Sync overlay state ===
   const [syncBusy, setSyncBusy] = useState(false);
@@ -154,6 +155,19 @@ export default function App() {
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
     syncTimerRef.current = setTimeout(() => setSyncBusy(false), 150);
   };
+
+  // スクロール保存/復元（手動再読込ボタン用。自動同期ではリロードしない設計に変更）
+  const SCROLL_KEY = 'mt_scrollY';
+  const reloadWithScrollSave = () => { try { sessionStorage.setItem(SCROLL_KEY, String(window.scrollY || 0)); } catch {} window.location.reload(); };
+  useEffect(() => {
+    try {
+      const y = Number(sessionStorage.getItem(SCROLL_KEY) || 'NaN');
+      if (Number.isFinite(y)) {
+        sessionStorage.removeItem(SCROLL_KEY);
+        setTimeout(() => window.scrollTo(0, y), 0);
+      }
+    } catch { /* noop */ }
+  }, []);
 
   // ローカル永続化
   useEffect(() => { localStorage.setItem(LS_INV, JSON.stringify(inventory)); }, [inventory]);
@@ -322,7 +336,6 @@ export default function App() {
         return false;
       }
 
-      // UI はすでに「接続中」表示の可能性あり
       const sb = cc(sbUrl, sbKey);
       supabaseRef.current = sb;
       setConnected(true);
@@ -343,17 +356,24 @@ export default function App() {
         if (upErr) throw upErr;
       }
 
-      // Realtime 購読
+      // Realtime 購読（ページリロードせずに反映）
       if (subscriptionRef.current) sb.removeChannel(subscriptionRef.current);
       const handler = (ev: any) => {
         try {
-          const remote = ev?.new?.payload as any;
+          const remote = ev?.new?.payload as RemotePayload;
           if (!remote) return;
           const remoteVer = Number(remote?.version || 0);
           if (pushingRef.current) return; // 自分の反射は無視
-          if (remoteVer <= Number(versionRef.current || 0)) return; // 進んだ更新のみ再接続
-          startSync('更新が入りました。再接続します…');
-          setTimeout(() => window.location.reload(), 150);
+          if (remoteVer <= Number(versionRef.current || 0)) return; // 古い/同一バージョンはスキップ
+          startSync('更新を反映中…');
+          if (applyTimerRef.current) clearTimeout(applyTimerRef.current);
+          applyTimerRef.current = setTimeout(() => {
+            setInventory(remote.inventory);
+            setBaseline(remote.baseline);
+            setCounts(remote.counts);
+            setVersion(remoteVer);
+            finishSync();
+          }, 100); // 連続イベントを軽くデバウンス
         } catch { /* noop */ }
       };
       const channel = sb
@@ -386,7 +406,7 @@ export default function App() {
       const remote = data?.payload as RemotePayload | undefined;
       if (remote?.sync?.busy && remote.sync.owner !== clientId.current) {
         startSync('同期中…');
-        return; // 他の端末の処理完了を待つ（Realtime/ポーリングで反映される）
+        return; // 他の端末の処理完了を待つ（Realtimeで反映）
       }
 
       // 自分がロック告知
@@ -423,9 +443,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // フォールバック: 5秒ポーリングは停止（自動再接続方式）
-  useEffect(() => { /* polling disabled */ }, []);
-
   // ===== DEV: 簡易テスト =====
   useEffect(() => {
     const results: { name: string; pass: boolean; got: any; expected: any }[] = [];
@@ -437,10 +454,8 @@ export default function App() {
     eq("白桃トッピング不足検出", canMakeWith(invNoPeach as Inventory, "白桃スカッシュ / さっぱり").ok, false);
     const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY; eq("トロピカル 1杯", servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"), 1);
     const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY; eq("トロピカル 2杯", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
-    // 追加: 白桃さっぱり1杯差し引きで max が1減る
     const afterOne = { ...INITIAL_INVENTORY, white_peach_syrup: INITIAL_INVENTORY.white_peach_syrup - 20, soda_white: INITIAL_INVENTORY.soda_white - 120, peach_pieces: INITIAL_INVENTORY.peach_pieces - 1 } as typeof INITIAL_INVENTORY;
     eq("白桃さっぱり 1杯後 max", servingsLeftWith(afterOne as any, "白桃スカッシュ / さっぱり"), 39);
-    // eslint-disable-next-line no-console
     console.table(results);
   }, []);
 
@@ -455,7 +470,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-2">
             <button onClick={() => setEditMode((v) => !v)} className={`px-4 py-2 rounded-2xl shadow ${editMode ? "bg-amber-600 hover:bg-amber-700 text-white" : "bg-white hover:bg-neutral-100 text-neutral-900"}`}>{editMode ? "在庫編集: ON" : "在庫編集: OFF"}</button>
-            <button onClick={() => window.location.reload()} className="px-3 py-2 rounded-2xl bg-white hover:bg-neutral-100 text-neutral-900 border border-neutral-200 shadow" title="ページを再読み込み">再読み込み</button>
+            <button onClick={reloadWithScrollSave} className="px-3 py-2 rounded-2xl bg-white hover:bg-neutral-100 text-neutral-900 border border-neutral-200 shadow" title="ページを再読み込み">再読み込み</button>
             <button onClick={resetAll} className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow" disabled={syncBusy}>リセット</button>
           </div>
         </header>
