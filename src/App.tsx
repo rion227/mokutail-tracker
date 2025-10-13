@@ -82,14 +82,18 @@ const LS_SYNC = "mt_sync";
 const LS_VER = "mt_ver";
 const LS_CLIENT = "mt_client";
 
-// ====== Supabase (optional) ======
-let createClient: any;
-try {
-  // @ts-ignore
-  createClient = require('@supabase/supabase-js').createClient;
-} catch (_) {
-  createClient = undefined;
-}
+// ====== Supabase (optional / lazy import) ======
+let createClient: any | null = null;
+const loadSupabase = async () => {
+  if (createClient) return createClient;
+  try {
+    const mod = await import('@supabase/supabase-js');
+    createClient = mod.createClient;
+    return createClient;
+  } catch {
+    return null;
+  }
+};
 
 // クライアント識別子（ソフトロックの所有者識別）
 function ensureClientId() {
@@ -126,6 +130,7 @@ export default function App() {
   const [roomId, setRoomId] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').room || ''; } catch { return ''; } });
   const [connected, setConnected] = useState(false);
   const supabaseRef = useRef<any>(null);
+  const versionRef = useRef<number>(0);
   const subscriptionRef = useRef<any>(null);
 
   // === Sync overlay state ===
@@ -147,7 +152,7 @@ export default function App() {
   useEffect(() => { localStorage.setItem(LS_INV, JSON.stringify(inventory)); }, [inventory]);
   useEffect(() => { localStorage.setItem(LS_BASE, JSON.stringify(baseline)); }, [baseline]);
   useEffect(() => { localStorage.setItem(LS_COUNTS, JSON.stringify(counts)); }, [counts]);
-  useEffect(() => { localStorage.setItem(LS_VER, String(version)); }, [version]);
+  useEffect(() => { localStorage.setItem(LS_VER, String(version)); versionRef.current = version; }, [version]);
   useEffect(() => { localStorage.setItem(LS_SYNC, JSON.stringify({ url: sbUrl, key: sbKey, room: roomId })); }, [sbUrl, sbKey, roomId]);
 
   // ---- helpers ----
@@ -288,10 +293,11 @@ export default function App() {
   });
 
   const connectSupabase = async () => {
-    if (!createClient) { alert(`supabase-js が見つかりません。
+    const cc = await loadSupabase();
+    if (!cc) { alert(`supabase-js が見つかりません。
 npm i @supabase/supabase-js を実行してください。`); return; }
     if (!sbUrl || !sbKey || !roomId) { alert('Supabase URL / anon key / Room ID を入力してください'); return; }
-    const sb = createClient(sbUrl, sbKey);
+    const sb = cc(sbUrl, sbKey);
     supabaseRef.current = sb;
     setConnected(true);
 
@@ -311,12 +317,15 @@ npm i @supabase/supabase-js を実行してください。`); return; }
     // Realtime 購読
     if (subscriptionRef.current) sb.removeChannel(subscriptionRef.current);
     const handler = (ev: any) => {
-      const remote = ev?.new?.payload as RemotePayload;
-      if (!remote) return;
-      if (pushingRef.current) return; // 自分の反射は無視
-      // 受信ではなく、全端末ハード再接続に切り替える
-      startSync('更新が入りました。再接続します…');
-      setTimeout(() => window.location.reload(), 150);
+      try {
+        const remote = ev?.new?.payload as any;
+        if (!remote) return;
+        const remoteVer = Number(remote?.version || 0);
+        if (pushingRef.current) return; // 自分の反射は無視
+        if (remoteVer <= Number(versionRef.current || 0)) return; // 進んだ更新のみ再接続
+        startSync('更新が入りました。再接続します…');
+        setTimeout(() => window.location.reload(), 150);
+      } catch { /* noop */ }
     };
     const channel = sb
       .channel(`rooms:${roomId}`)
