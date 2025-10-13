@@ -313,17 +313,10 @@ npm i @supabase/supabase-js を実行してください。`); return; }
     const handler = (ev: any) => {
       const remote = ev?.new?.payload as RemotePayload;
       if (!remote) return;
-      // ロック広報
-      const rSync = remote.sync;
-      if (rSync?.busy && rSync.owner !== clientId.current) {
-        startSync('同期中…');
-      } else {
-        finishSync();
-      }
-      const rVer = Number(remote.version || 0);
-      if (pushingRef.current) return;
-      if (rVer <= version) return;
-      setInventory(remote.inventory); setBaseline(remote.baseline); setCounts(remote.counts); setVersion(rVer);
+      if (pushingRef.current) return; // 自分の反射は無視
+      // 受信ではなく、全端末ハード再接続に切り替える
+      startSync('更新が入りました。再接続します…');
+      setTimeout(() => window.location.reload(), 150);
     };
     const channel = sb
       .channel(`rooms:${roomId}`)
@@ -366,25 +359,8 @@ npm i @supabase/supabase-js を実行してください。`); return; }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inventory, baseline, counts]);
 
-  // フォールバック: 5秒ポーリング（受信専用 / ロック表示連動）
-  useEffect(() => {
-    if (!connected || !supabaseRef.current || !roomId) return;
-    const sb = supabaseRef.current;
-    const id = setInterval(async () => {
-      try {
-        if (pushingRef.current) return;
-        const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
-        const remote = data?.payload as RemotePayload | undefined;
-        if (!remote) return;
-        if (remote?.sync?.busy && remote.sync.owner !== clientId.current) startSync('同期中…'); else finishSync();
-        const rVer = Number(remote?.version || 0);
-        if (rVer > version) {
-          setInventory(remote.inventory); setBaseline(remote.baseline); setCounts(remote.counts); setVersion(rVer);
-        }
-      } catch {}
-    }, 5000);
-    return () => clearInterval(id);
-  }, [connected, roomId, version]);
+  // フォールバック: 5秒ポーリングは停止（自動再接続方式）
+  useEffect(() => { /* polling disabled */ }, []);
 
   // ===== DEV: 簡易テスト =====
   useEffect(() => {
@@ -415,6 +391,7 @@ npm i @supabase/supabase-js を実行してください。`); return; }
           </div>
           <div className="flex items-center gap-2">
             <button onClick={() => setEditMode((v) => !v)} className={`px-4 py-2 rounded-2xl shadow ${editMode ? "bg-amber-600 hover:bg-amber-700 text-white" : "bg-white hover:bg-neutral-100 text-neutral-900"}`}>{editMode ? "在庫編集: ON" : "在庫編集: OFF"}</button>
+            <button onClick={() => window.location.reload()} className="px-3 py-2 rounded-2xl bg-white hover:bg-neutral-100 text-neutral-900 border border-neutral-200 shadow" title="ページを再読み込み">再読み込み</button>
             <button onClick={resetAll} className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow" disabled={syncBusy}>リセット</button>
           </div>
         </header>
