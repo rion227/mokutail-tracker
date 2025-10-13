@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-// 共有同期対応版（Supabase optional）
+// 共有同期対応版（Supabase optional）WWW
 // - ローカル保存 + 任意で Supabase を使った端末間同期（同じ Room ID で共有）
 // - Room に接続すると、在庫/基準/カウントをクラウドへ保存し、他端末とリアルタイム同期
 // - 既存機能：在庫編集・残量バー（補充時100%）・取り消し・売上/原価サマリー
@@ -119,6 +119,22 @@ export default function App() {
   const supabaseRef = useRef<any>(null);
   const subscriptionRef = useRef<any>(null);
   const pushingRef = useRef(false); // 反射更新ループ回避
+
+  // === Sync overlay state ===
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncMsg, setSyncMsg] = useState<string>("");
+  const syncTimerRef = useRef<any>(null);
+  const startSync = (msg: string) => {
+    setSyncMsg(msg);
+    setSyncBusy(true);
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    // フェイルセーフ（通信不良時に固まらないように）
+    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 2000);
+  };
+  const finishSync = () => {
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 120);
+  };
 
   // ---- persist ----
   useEffect(() => { localStorage.setItem(LS_INV, JSON.stringify(inventory)); }, [inventory]);
@@ -242,12 +258,14 @@ export default function App() {
 
   // ====== Supabase 同期 ======
   const connectSupabase = async () => {
-    if (!createClient) { alert(`supabase-js が見つかりません。
-npm i @supabase/supabase-js を実行してください。`); return; }
+    if (!createClient) { alert(`supabase-js が見つかりません。\nnpm i @supabase/supabase-js を実行してください。`); return; }
     if (!sbUrl || !sbKey || !roomId) { alert('Supabase URL / anon key / Room ID を入力してください'); return; }
     const sb = createClient(sbUrl, sbKey);
     supabaseRef.current = sb;
     setConnected(true);
+
+    // 初回接続の同期インジケーター
+    startSync('接続中…');
 
     // 初回 pull（存在すれば取得、なければ作成）
     const basePayload = { inventory, baseline, counts, version, updated_at: new Date().toISOString() };
@@ -257,18 +275,25 @@ npm i @supabase/supabase-js を実行してください。`); return; }
         const remote = got.payload;
         const remoteVer = Number(remote?.version || 0);
         if (remoteVer > version) {
+          // リモートが新しければ引き込む
           pushingRef.current = true;
           setInventory(remote.inventory);
           setBaseline(remote.baseline);
           setCounts(remote.counts);
           setVersion(remoteVer);
-          setTimeout(() => { pushingRef.current = false; }, 50);
+          setTimeout(() => { pushingRef.current = false; finishSync(); }, 80);
         } else {
+          // ローカルが新しければ現状をアップサート
           await sb.from('rooms').upsert({ id: roomId, payload: basePayload }, { onConflict: 'id' });
+          finishSync();
         }
-      } catch {}
+      } catch {
+        finishSync();
+      }
     } else {
+      // レコードが無ければ作成
       await sb.from('rooms').upsert({ id: roomId, payload: basePayload }, { onConflict: 'id' });
+      finishSync();
     }
 
     // Realtime 購読（INSERT/UPDATE の両方）
@@ -278,12 +303,14 @@ npm i @supabase/supabase-js を実行してください。`); return; }
         const remote = payloadEv?.new?.payload;
         if (!remote) return;
         const remoteVer = Number(remote?.version || 0);
-        if (pushingRef.current) return; // 自分が push した直後の反射をスキップ
+        if (pushingRef.current) return; // 自分の push 直後の反射は無視
         if (remoteVer <= version) return; // 古い更新は無視
+        startSync('同期中…');
         setInventory(remote.inventory);
         setBaseline(remote.baseline);
         setCounts(remote.counts);
         setVersion(remoteVer);
+        finishSync();
       } catch {}
     };
 
@@ -302,63 +329,21 @@ npm i @supabase/supabase-js を実行してください。`); return; }
       const sb = supabaseRef.current;
       const nextVersion = Number(version) + 1;
       const payload = { inventory, baseline, counts, version: nextVersion, updated_at: new Date().toISOString() };
+      startSync('更新を共有中…');
       pushingRef.current = true;
       await sb.from('rooms').upsert({ id: roomId, payload }, { onConflict: 'id' });
       setVersion(nextVersion);
-      setTimeout(() => { pushingRef.current = false; }, 50);
+      setTimeout(() => { pushingRef.current = false; finishSync(); }, 80);
     };
     push();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inventory, baseline, counts]);
 
-  // ★ Fallback: ポーリング（Realtime が届かない端末/回線向け）
-  useEffect(() => {
-    if (!connected || !supabaseRef.current || !roomId) return;
-    const sb = supabaseRef.current;
-    const id = setInterval(async () => {
-      try {
-        if (pushingRef.current) return; // 自分の更新直後はスキップ
-        const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
-        const remote = data?.payload;
-        if (!remote) return;
-        const remoteVer = Number(remote?.version || 0);
-        if (remoteVer <= version) return; // 古い更新は反映しない
-        setInventory(remote.inventory);
-        setBaseline(remote.baseline);
-        setCounts(remote.counts);
-        setVersion(remoteVer);
-      } catch {}
-    }, 5000); // 5秒間隔
-    return () => clearInterval(id);
-  }, [connected, roomId, version]);
-
-  // ★ Fallback: ポーリング（Realtime が届かない端末/回線向け）
-  useEffect(() => {
-    if (!connected || !supabaseRef.current || !roomId) return;
-    const sb = supabaseRef.current;
-    const id = setInterval(async () => {
-      try {
-        if (pushingRef.current) return; // 自分の更新直後はスキップ
-        const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
-        const remote = data?.payload;
-        if (!remote) return;
-        // 何か差があれば反映（updated_at の比較でもOK）
-        if (JSON.stringify(remote.inventory) !== JSON.stringify(inventory) ||
-            JSON.stringify(remote.counts) !== JSON.stringify(counts) ||
-            JSON.stringify(remote.baseline) !== JSON.stringify(baseline)) {
-          setInventory(remote.inventory);
-          setBaseline(remote.baseline);
-          setCounts(remote.counts);
-        }
-      } catch {}
-    }, 5000); // 5秒間隔
-    return () => clearInterval(id);
-  }, [connected, roomId, inventory, baseline, counts]);
-
   // ===== DEV: 簡易テスト =====
   useEffect(() => {
     const results: { name: string; pass: boolean; got: any; expected: any }[] = [];
     const eq = (name: string, got: any, expected: any) => results.push({ name, pass: Object.is(got, expected), got, expected });
+    // 既存テスト
     eq("白桃さっぱり max", servingsLeftWith(INITIAL_INVENTORY as any, "白桃スカッシュ / さっぱり"), 40);
     eq("モヒート甘め max", servingsLeftWith(INITIAL_INVENTORY as any, "パインモヒート / 甘め"), 35);
     eq("トロピカルすっきり max", servingsLeftWith(INITIAL_INVENTORY as any, "トロピカルスカッシュ / すっきり"), 30);
@@ -367,6 +352,10 @@ npm i @supabase/supabase-js を実行してください。`); return; }
     eq("白桃トッピング不足検出", checkPeach.ok, false);
     const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY; eq("トロピカル 1杯", servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"), 1);
     const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY; eq("トロピカル 2杯", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
+    // 追加テスト（カウント増減が在庫に反映されるか）
+    const before = servingsLeftWith(INITIAL_INVENTORY as any, "白桃スカッシュ / さっぱり");
+    const after = servingsLeftWith({ ...INITIAL_INVENTORY, white_peach_syrup: INITIAL_INVENTORY.white_peach_syrup - 20, soda_white: INITIAL_INVENTORY.soda_white - 120, peach_pieces: INITIAL_INVENTORY.peach_pieces - 1 } as any, "白桃スカッシュ / さっぱり");
+    eq("白桃さっぱり 1杯作成後 max", after, before - 1);
     // eslint-disable-next-line no-console
     console.table(results);
   }, []);
@@ -437,10 +426,30 @@ npm i @supabase/supabase-js を実行してください。`); return; }
                 </div>
 
                 {/* アクション */}
-                <div className="mt-auto flex gap-2">
-                  <button onClick={() => makeOne(key)} disabled={!ok} className={`px-4 py-2 rounded-xl font-medium shadow transition ${ok ? "bg-emerald-600 hover:bg-emerald-700 text-white" : "bg-neutral-200 text-neutral-500 cursor-not-allowed"}`}>1杯作る</button>
-                  <button onClick={() => undoOne(key)} disabled={(counts[key] || 0) === 0} className={`px-4 py-2 rounded-xl font-medium shadow transition ${(counts[key] || 0) > 0 ? "bg-red-600 hover:bg-red-700 text-white" : "bg-neutral-200 text-neutral-500 cursor-not-allowed"}`} title="直前の誤操作などを取り消して1杯分を在庫に戻します">1杯減らす</button>
-                </div>
+                {(() => {
+                  const controlsDisabled = syncBusy;
+                  const disabledMake = !ok || controlsDisabled;
+                  const disabledUndo = (counts[key] || 0) === 0 || controlsDisabled;
+                  return (
+                    <div className="mt-auto flex gap-2">
+                      <button
+                        onClick={() => makeOne(key)}
+                        disabled={disabledMake}
+                        className={`px-4 py-2 rounded-xl font-medium shadow transition ${disabledMake ? "bg-neutral-200 text-neutral-500 cursor-not-allowed" : "bg-emerald-600 hover:bg-emerald-700 text-white"}`}
+                      >
+                        1杯作る
+                      </button>
+                      <button
+                        onClick={() => undoOne(key)}
+                        disabled={disabledUndo}
+                        className={`px-4 py-2 rounded-xl font-medium shadow transition ${disabledUndo ? "bg-neutral-200 text-neutral-500 cursor-not-allowed" : "bg-red-600 hover:bg-red-700 text-white"}`}
+                        title="直前の誤操作などを取り消して1杯分を在庫に戻します"
+                      >
+                        1杯減らす
+                      </button>
+                    </div>
+                  );
+                })()}
 
                 {!ok && (<div className="text-xs text-red-600">在庫不足：{blockers.join("・")}</div>)}
               </div>
@@ -495,6 +504,19 @@ npm i @supabase/supabase-js を実行してください。`); return; }
           </div>
           <p className="text-xs text-neutral-500 mt-2">※ 在庫を補充（手動編集/＋ボタン）した時点の値が新しい100%になります。作成/取り消しでは基準は更新されません。</p>
         </section>
+
+        {/* 中央の小さな同期ポップ */}
+        {syncBusy && (
+          <div className="fixed inset-0 pointer-events-none flex items-start justify-center">
+            <div className="mt-10 px-4 py-2 rounded-xl shadow bg-neutral-900/90 text-white text-sm flex items-center gap-2">
+              <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/>
+              </svg>
+              <span>{syncMsg || '同期中…'}</span>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
