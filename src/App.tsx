@@ -151,7 +151,6 @@ export default function App() {
     }
     return isFinite(min) ? min : 0;
   };
-  //const servingsLeft = (recipeKey: string) => servingsLeftWith(inventory, recipeKey);
 
   const updateBaselineIfIncreased = (key: keyof Inventory, nextVal: number) => {
     setBaseline((prev: Baseline) => ({ ...prev, [key]: Math.max((prev as any)[key] ?? 0, nextVal) } as Baseline));
