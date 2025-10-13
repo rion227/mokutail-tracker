@@ -141,6 +141,20 @@ export default function App() {
   const subscriptionRef = useRef<any>(null);
   const applyTimerRef = useRef<any>(null); // Realtime反映のデバウンス
 
+  // ---- lock control (reduce flicker) ----
+  const LOCK_TTL_MS = 3000; // 他端末のロック有効時間（ms）
+  const lockUntilRef = useRef<number>(0);
+  const [lockActive, setLockActive] = useState(false);
+  const lockTimerRef = useRef<any>(null);
+  const markLockedUntil = (until: number) => {
+    lockUntilRef.current = until;
+    setLockActive(true);
+    if (lockTimerRef.current) clearTimeout(lockTimerRef.current);
+    const delay = Math.max(0, until - Date.now());
+    lockTimerRef.current = setTimeout(() => setLockActive(false), delay + 50);
+  };
+  const actionsBlocked = () => pushingRef.current || lockActive;
+
   // === Sync overlay state ===
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string>("");
@@ -208,7 +222,7 @@ export default function App() {
   // ---- actions ----
   const makeOne = (recipeKey: string) => {
     const check = canMake(recipeKey);
-    if (!check.ok || syncBusy) return;
+    if (!check.ok || actionsBlocked()) return;
     const recipe = RECIPES[recipeKey];
     setInventory((prev: Inventory) => {
       const next: Inventory = { ...prev } as Inventory;
@@ -219,7 +233,7 @@ export default function App() {
   };
 
   const undoOne = (recipeKey: string) => {
-    if (syncBusy) return;
+    if (actionsBlocked()) return;
     setCounts((prev: Counts) => { const cur = prev[recipeKey] || 0; if (cur <= 0) return prev; return { ...prev, [recipeKey]: cur - 1 }; });
     const recipe = RECIPES[recipeKey];
     setInventory((prev: Inventory) => {
@@ -230,20 +244,20 @@ export default function App() {
   };
 
   const resetAll = () => {
-    if (syncBusy) return;
+    if (actionsBlocked()) return;
     setInventory(INITIAL_INVENTORY);
     setBaseline(INITIAL_INVENTORY);
     const o: Counts = {}; (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0)); setCounts(o);
   };
 
   const setInventoryValue = (key: keyof Inventory, value: number) => {
-    if (syncBusy) return;
+    if (actionsBlocked()) return;
     const v = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
     setInventory((prev: Inventory) => ({ ...prev, [key]: v } as Inventory));
     updateBaselineIfIncreased(key, v);
   };
   const bumpInventory = (key: keyof Inventory, delta: number) => {
-    if (syncBusy) return;
+    if (actionsBlocked()) return;
     setInventory((prev: Inventory) => {
       const nextVal = Math.max(0, (prev[key] as number) + delta);
       const next: Inventory = { ...prev, [key]: nextVal } as Inventory;
@@ -362,18 +376,27 @@ export default function App() {
         try {
           const remote = ev?.new?.payload as RemotePayload;
           if (!remote) return;
+          // ロック情報を更新（他端末が busy の間のみ操作ブロック）
+          const busy = !!remote?.sync?.busy;
+          const owner = remote?.sync?.owner;
+          const started = Number(remote?.sync?.started_at || 0);
+          if (busy && owner && owner !== clientId.current) {
+            const until = started + LOCK_TTL_MS;
+            if (until > Date.now()) markLockedUntil(until);
+          }
+
           const remoteVer = Number(remote?.version || 0);
           if (pushingRef.current) return; // 自分の反射は無視
           if (remoteVer <= Number(versionRef.current || 0)) return; // 古い/同一バージョンはスキップ
-          startSync('更新を反映中…');
+
+          // ページリロードはせず、静かに適用（デバウンス）
           if (applyTimerRef.current) clearTimeout(applyTimerRef.current);
           applyTimerRef.current = setTimeout(() => {
             setInventory(remote.inventory);
             setBaseline(remote.baseline);
             setCounts(remote.counts);
             setVersion(remoteVer);
-            finishSync();
-          }, 100); // 連続イベントを軽くデバウンス
+          }, 100);
         } catch { /* noop */ }
       };
       const channel = sb
@@ -401,12 +424,16 @@ export default function App() {
 
       const sb = supabaseRef.current;
 
-      // 直近のリモートを確認。誰かが busy(true) なら待機（表示のみ）
+      // 直近のリモートを確認。誰かが busy(true) なら、TTL内は自分の送信を少し遅らせる（リトライ）
       const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
       const remote = data?.payload as RemotePayload | undefined;
       if (remote?.sync?.busy && remote.sync.owner !== clientId.current) {
-        startSync('同期中…');
-        return; // 他の端末の処理完了を待つ（Realtimeで反映）
+        const started = Number(remote.sync.started_at || 0);
+        const until = started + LOCK_TTL_MS;
+        const delay = Math.max(0, until - Date.now()) + 200;
+        markLockedUntil(until);
+        setTimeout(push, delay);
+        return;
       }
 
       // 自分がロック告知
@@ -447,6 +474,8 @@ export default function App() {
   useEffect(() => {
     const results: { name: string; pass: boolean; got: any; expected: any }[] = [];
     const eq = (name: string, got: any, expected: any) => results.push({ name, pass: Object.is(got, expected), got, expected });
+
+    // 既存ケース
     eq("白桃さっぱり max", servingsLeftWith(INITIAL_INVENTORY as any, "白桃スカッシュ / さっぱり"), 40);
     eq("モヒート甘め max", servingsLeftWith(INITIAL_INVENTORY as any, "パインモヒート / 甘め"), 35);
     eq("トロピカルすっきり max", servingsLeftWith(INITIAL_INVENTORY as any, "トロピカルスカッシュ / すっきり"), 30);
@@ -456,6 +485,19 @@ export default function App() {
     const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY; eq("トロピカル 2杯", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
     const afterOne = { ...INITIAL_INVENTORY, white_peach_syrup: INITIAL_INVENTORY.white_peach_syrup - 20, soda_white: INITIAL_INVENTORY.soda_white - 120, peach_pieces: INITIAL_INVENTORY.peach_pieces - 1 } as typeof INITIAL_INVENTORY;
     eq("白桃さっぱり 1杯後 max", servingsLeftWith(afterOne as any, "白桃スカッシュ / さっぱり"), 39);
+
+    // 追加ケース: canMake が ok=false を返す状況
+    const invLackSyrup = { ...INITIAL_INVENTORY, white_peach_syrup: 19 } as typeof INITIAL_INVENTORY;
+    eq("白桃さっぱり syrup不足で作れない", canMakeWith(invLackSyrup as Inventory, "白桃スカッシュ / さっぱり").ok, false);
+    const invLackSoda = { ...INITIAL_INVENTORY, soda_white: 119 } as typeof INITIAL_INVENTORY;
+    eq("白桃さっぱり soda不足で作れない", canMakeWith(invLackSoda as Inventory, "白桃スカッシュ / さっぱり").ok, false);
+
+    // 追加ケース: perCupCost が0より大
+    const costPeach = ((): number => {
+      const r = RECIPES["白桃スカッシュ / さっぱり"]; let c = 0; for (const k in r) c += (k === 'peach_pieces' ? PEACH_GARNISH_COST : (UNIT_COSTS as any)[k] || 0) * (r as any)[k]; return Math.round(c*10)/10; })();
+    eq("1杯原価>0", costPeach > 0, true);
+
+    // eslint-disable-next-line no-console
     console.table(results);
   }, []);
 
@@ -471,7 +513,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <button onClick={() => setEditMode((v) => !v)} className={`px-4 py-2 rounded-2xl shadow ${editMode ? "bg-amber-600 hover:bg-amber-700 text-white" : "bg-white hover:bg-neutral-100 text-neutral-900"}`}>{editMode ? "在庫編集: ON" : "在庫編集: OFF"}</button>
             <button onClick={reloadWithScrollSave} className="px-3 py-2 rounded-2xl bg-white hover:bg-neutral-100 text-neutral-900 border border-neutral-200 shadow" title="ページを再読み込み">再読み込み</button>
-            <button onClick={resetAll} className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow" disabled={syncBusy}>リセット</button>
+            <button onClick={resetAll} className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow" disabled={actionsBlocked()}>リセット</button>
           </div>
         </header>
 
@@ -527,8 +569,8 @@ export default function App() {
 
                 {/* アクション */}
                 {(() => {
-                  const disabledMake = !ok || syncBusy;
-                  const disabledUndo = (counts[key] || 0) === 0 || syncBusy;
+                  const disabledMake = !ok || actionsBlocked();
+                  const disabledUndo = (counts[key] || 0) === 0 || actionsBlocked();
                   return (
                     <div className="mt-auto flex gap-2">
                       <button
