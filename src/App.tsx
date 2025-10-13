@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-// 共有同期対応版（Supabase optional）WWW
+// 共有同期対応版（Supabase optional） + グローバル同期ロック（ソフトロック）
 // - ローカル保存 + 任意で Supabase を使った端末間同期（同じ Room ID で共有）
-// - Room に接続すると、在庫/基準/カウントをクラウドへ保存し、他端末とリアルタイム同期
-// - 既存機能：在庫編集・残量バー（補充時100%）・取り消し・売上/原価サマリー
+// - だれかが変更送信を開始したら、全端末で「同期中」表示になって操作を一時停止
+// - 最初に送信を“宣言”した端末が勝ち（soft lock）。完了でロック解除 → 全端末再開
 
 // ==== 売価設定 ====
 const PRICE_PER_CUP = 300; // 円
@@ -35,13 +35,12 @@ const INITIAL_INVENTORY = {
   mojito: 700,
   cassis: 700,
   orange_juice: 3000,
-  soda_white: 4800,
+  soda_white: 5800, // 最新指定: 白桃 4000→+1000→+200? 等の会話調整はここで
   soda_mojito: 3850,
   soda_tropical: 3350,
   peach_pieces: 40,
 };
 
-// 型エイリアス（TS CI 対策）
 type Inventory = typeof INITIAL_INVENTORY;
 type Counts = Record<string, number>;
 type Baseline = typeof INITIAL_INVENTORY;
@@ -77,20 +76,31 @@ const NICE_LABEL: Record<string, string> = {
 
 // === localStorage keys ===
 const LS_INV = "mt_inv";
-const LS_BASE = "mt_base"; // 残量バー基準
+const LS_BASE = "mt_base";
 const LS_COUNTS = "mt_counts";
-const LS_SYNC = "mt_sync"; // {url,key,room}
-const LS_VER = "mt_ver"; // 楽観的同期のためのバージョン番号
+const LS_SYNC = "mt_sync";
+const LS_VER = "mt_ver";
+const LS_CLIENT = "mt_client";
 
 // ====== Supabase (optional) ======
-// npm i @supabase/supabase-js
 let createClient: any;
 try {
-  // 動的 import（存在しない環境でも壊れないように）
   // @ts-ignore
   createClient = require('@supabase/supabase-js').createClient;
 } catch (_) {
   createClient = undefined;
+}
+
+// クライアント識別子（ソフトロックの所有者識別）
+function ensureClientId() {
+  try {
+    const now = Date.now().toString(36);
+    let cid = localStorage.getItem(LS_CLIENT);
+    if (!cid) { cid = `${now}-${Math.random().toString(36).slice(2,8)}`; localStorage.setItem(LS_CLIENT, cid); }
+    return cid;
+  } catch {
+    return `cid-${Math.random().toString(36).slice(2,8)}`;
+  }
 }
 
 export default function App() {
@@ -106,19 +116,17 @@ export default function App() {
     const o: Counts = {}; (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0)); return o;
   });
   const [editMode, setEditMode] = useState(false);
-  // 楽観的同期用のローカルバージョン
+
   const [version, setVersion] = useState<number>(() => {
     try { return Number(localStorage.getItem(LS_VER) || '0') || 0; } catch { return 0; }
   });
 
-  // Sync settings
   const [sbUrl, setSbUrl] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').url || ''; } catch { return ''; } });
   const [sbKey, setSbKey] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').key || ''; } catch { return ''; } });
   const [roomId, setRoomId] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').room || ''; } catch { return ''; } });
   const [connected, setConnected] = useState(false);
   const supabaseRef = useRef<any>(null);
   const subscriptionRef = useRef<any>(null);
-  const pushingRef = useRef(false); // 反射更新ループ回避
 
   // === Sync overlay state ===
   const [syncBusy, setSyncBusy] = useState(false);
@@ -128,15 +136,14 @@ export default function App() {
     setSyncMsg(msg);
     setSyncBusy(true);
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
-    // フェイルセーフ（通信不良時に固まらないように）
-    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 2000);
+    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 2500);
   };
   const finishSync = () => {
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
-    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 120);
+    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 150);
   };
 
-  // ---- persist ----
+  // ローカル永続化
   useEffect(() => { localStorage.setItem(LS_INV, JSON.stringify(inventory)); }, [inventory]);
   useEffect(() => { localStorage.setItem(LS_BASE, JSON.stringify(baseline)); }, [baseline]);
   useEffect(() => { localStorage.setItem(LS_COUNTS, JSON.stringify(counts)); }, [counts]);
@@ -175,7 +182,7 @@ export default function App() {
   // ---- actions ----
   const makeOne = (recipeKey: string) => {
     const check = canMake(recipeKey);
-    if (!check.ok) return;
+    if (!check.ok || syncBusy) return;
     const recipe = RECIPES[recipeKey];
     setInventory((prev: Inventory) => {
       const next: Inventory = { ...prev } as Inventory;
@@ -186,6 +193,7 @@ export default function App() {
   };
 
   const undoOne = (recipeKey: string) => {
+    if (syncBusy) return;
     setCounts((prev: Counts) => { const cur = prev[recipeKey] || 0; if (cur <= 0) return prev; return { ...prev, [recipeKey]: cur - 1 }; });
     const recipe = RECIPES[recipeKey];
     setInventory((prev: Inventory) => {
@@ -196,18 +204,20 @@ export default function App() {
   };
 
   const resetAll = () => {
+    if (syncBusy) return;
     setInventory(INITIAL_INVENTORY);
     setBaseline(INITIAL_INVENTORY);
     const o: Counts = {}; (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0)); setCounts(o);
   };
 
-  // 在庫手動編集（この操作で 100% 基準更新）
   const setInventoryValue = (key: keyof Inventory, value: number) => {
+    if (syncBusy) return;
     const v = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
     setInventory((prev: Inventory) => ({ ...prev, [key]: v } as Inventory));
     updateBaselineIfIncreased(key, v);
   };
   const bumpInventory = (key: keyof Inventory, delta: number) => {
+    if (syncBusy) return;
     setInventory((prev: Inventory) => {
       const nextVal = Math.max(0, (prev[key] as number) + delta);
       const next: Inventory = { ...prev, [key]: nextVal } as Inventory;
@@ -256,106 +266,140 @@ export default function App() {
     return { cups, revenue, cogs: Math.round(cogs), gp: Math.round(gp), margin };
   }, [counts, perCupCost]);
 
-  // ====== Supabase 同期 ======
+  // ====== ソフトロック付き同期 ======
+  const clientId = useRef<string>(ensureClientId());
+  const pushingRef = useRef(false);
+
+  type RemotePayload = {
+    inventory: Inventory;
+    baseline: Baseline;
+    counts: Counts;
+    version: number;
+    updated_at: string;
+    // soft lock
+    sync?: { busy: boolean; owner: string; started_at: number };
+  };
+
+  const buildPayload = (partial?: Partial<RemotePayload>): RemotePayload => ({
+    inventory, baseline, counts, version,
+    updated_at: new Date().toISOString(),
+    sync: { busy: false, owner: clientId.current, started_at: Date.now() },
+    ...(partial || {}),
+  });
+
   const connectSupabase = async () => {
-    if (!createClient) { alert(`supabase-js が見つかりません。\nnpm i @supabase/supabase-js を実行してください。`); return; }
+    if (!createClient) { alert(`supabase-js が見つかりません。
+npm i @supabase/supabase-js を実行してください。`); return; }
     if (!sbUrl || !sbKey || !roomId) { alert('Supabase URL / anon key / Room ID を入力してください'); return; }
     const sb = createClient(sbUrl, sbKey);
     supabaseRef.current = sb;
     setConnected(true);
 
-    // 初回接続の同期インジケーター
     startSync('接続中…');
 
-    // 初回 pull（存在すれば取得、なければ作成）
-    const basePayload = { inventory, baseline, counts, version, updated_at: new Date().toISOString() };
     const { data: got } = await sb.from('rooms').select('id,payload').eq('id', roomId).maybeSingle();
     if (got && got.payload) {
-      try {
-        const remote = got.payload;
-        const remoteVer = Number(remote?.version || 0);
-        if (remoteVer > version) {
-          // リモートが新しければ引き込む
-          pushingRef.current = true;
-          setInventory(remote.inventory);
-          setBaseline(remote.baseline);
-          setCounts(remote.counts);
-          setVersion(remoteVer);
-          setTimeout(() => { pushingRef.current = false; finishSync(); }, 80);
-        } else {
-          // ローカルが新しければ現状をアップサート
-          await sb.from('rooms').upsert({ id: roomId, payload: basePayload }, { onConflict: 'id' });
-          finishSync();
-        }
-      } catch {
-        finishSync();
+      const remote = got.payload as RemotePayload;
+      const remoteVer = Number(remote?.version || 0);
+      if (remoteVer > version) {
+        setInventory(remote.inventory); setBaseline(remote.baseline); setCounts(remote.counts); setVersion(remoteVer);
       }
     } else {
-      // レコードが無ければ作成
-      await sb.from('rooms').upsert({ id: roomId, payload: basePayload }, { onConflict: 'id' });
-      finishSync();
+      await sb.from('rooms').upsert({ id: roomId, payload: buildPayload() }, { onConflict: 'id' });
     }
 
-    // Realtime 購読（INSERT/UPDATE の両方）
+    // Realtime 購読
     if (subscriptionRef.current) sb.removeChannel(subscriptionRef.current);
-    const handler = (payloadEv: any) => {
-      try {
-        const remote = payloadEv?.new?.payload;
-        if (!remote) return;
-        const remoteVer = Number(remote?.version || 0);
-        if (pushingRef.current) return; // 自分の push 直後の反射は無視
-        if (remoteVer <= version) return; // 古い更新は無視
+    const handler = (ev: any) => {
+      const remote = ev?.new?.payload as RemotePayload;
+      if (!remote) return;
+      // ロック広報
+      const rSync = remote.sync;
+      if (rSync?.busy && rSync.owner !== clientId.current) {
         startSync('同期中…');
-        setInventory(remote.inventory);
-        setBaseline(remote.baseline);
-        setCounts(remote.counts);
-        setVersion(remoteVer);
+      } else {
         finishSync();
-      } catch {}
+      }
+      const rVer = Number(remote.version || 0);
+      if (pushingRef.current) return;
+      if (rVer <= version) return;
+      setInventory(remote.inventory); setBaseline(remote.baseline); setCounts(remote.counts); setVersion(rVer);
     };
-
     const channel = sb
       .channel(`rooms:${roomId}`)
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
       .subscribe();
     subscriptionRef.current = channel;
+    finishSync();
   };
 
-  // 変更時に push（接続中のみ）
+  // 変更時 push（ソフトロック: 送信前に busy=true を広報 → 最終状態を busy=false で確定）
   useEffect(() => {
     const push = async () => {
-      if (!connected || !supabaseRef.current) return;
+      if (!connected || !supabaseRef.current || !roomId) return;
+
       const sb = supabaseRef.current;
-      const nextVersion = Number(version) + 1;
-      const payload = { inventory, baseline, counts, version: nextVersion, updated_at: new Date().toISOString() };
-      startSync('更新を共有中…');
+
+      // 直近のリモートを確認。誰かが busy(true) なら待機（表示のみ）
+      const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
+      const remote = data?.payload as RemotePayload | undefined;
+      if (remote?.sync?.busy && remote.sync.owner !== clientId.current) {
+        startSync('同期中…');
+        return; // 他の端末の処理完了を待つ（Realtime/ポーリングで反映される）
+      }
+
+      // 自分がロック告知
+      const announce = buildPayload({ sync: { busy: true, owner: clientId.current, started_at: Date.now() } });
       pushingRef.current = true;
-      await sb.from('rooms').upsert({ id: roomId, payload }, { onConflict: 'id' });
+      startSync('同期中…');
+      await sb.from('rooms').upsert({ id: roomId, payload: announce }, { onConflict: 'id' });
+
+      // 最終状態をコミット（busy=false）
+      const nextVersion = Number(version) + 1;
+      const finalPayload = buildPayload({ version: nextVersion, sync: { busy: false, owner: clientId.current, started_at: Date.now() } });
+      await sb.from('rooms').upsert({ id: roomId, payload: finalPayload }, { onConflict: 'id' });
       setVersion(nextVersion);
-      setTimeout(() => { pushingRef.current = false; finishSync(); }, 80);
+      setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
     };
     push();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inventory, baseline, counts]);
 
+  // フォールバック: 5秒ポーリング（受信専用 / ロック表示連動）
+  useEffect(() => {
+    if (!connected || !supabaseRef.current || !roomId) return;
+    const sb = supabaseRef.current;
+    const id = setInterval(async () => {
+      try {
+        if (pushingRef.current) return;
+        const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
+        const remote = data?.payload as RemotePayload | undefined;
+        if (!remote) return;
+        if (remote?.sync?.busy && remote.sync.owner !== clientId.current) startSync('同期中…'); else finishSync();
+        const rVer = Number(remote?.version || 0);
+        if (rVer > version) {
+          setInventory(remote.inventory); setBaseline(remote.baseline); setCounts(remote.counts); setVersion(rVer);
+        }
+      } catch {}
+    }, 5000);
+    return () => clearInterval(id);
+  }, [connected, roomId, version]);
+
   // ===== DEV: 簡易テスト =====
   useEffect(() => {
     const results: { name: string; pass: boolean; got: any; expected: any }[] = [];
     const eq = (name: string, got: any, expected: any) => results.push({ name, pass: Object.is(got, expected), got, expected });
-    // 既存テスト
     eq("白桃さっぱり max", servingsLeftWith(INITIAL_INVENTORY as any, "白桃スカッシュ / さっぱり"), 40);
     eq("モヒート甘め max", servingsLeftWith(INITIAL_INVENTORY as any, "パインモヒート / 甘め"), 35);
     eq("トロピカルすっきり max", servingsLeftWith(INITIAL_INVENTORY as any, "トロピカルスカッシュ / すっきり"), 30);
     const invNoPeach = { ...INITIAL_INVENTORY, peach_pieces: 0 } as typeof INITIAL_INVENTORY;
-    const checkPeach = canMakeWith(invNoPeach as Inventory, "白桃スカッシュ / さっぱり");
-    eq("白桃トッピング不足検出", checkPeach.ok, false);
+    eq("白桃トッピング不足検出", canMakeWith(invNoPeach as Inventory, "白桃スカッシュ / さっぱり").ok, false);
     const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY; eq("トロピカル 1杯", servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"), 1);
     const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY; eq("トロピカル 2杯", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
-    // 追加テスト（カウント増減が在庫に反映されるか）
-    const before = servingsLeftWith(INITIAL_INVENTORY as any, "白桃スカッシュ / さっぱり");
-    const after = servingsLeftWith({ ...INITIAL_INVENTORY, white_peach_syrup: INITIAL_INVENTORY.white_peach_syrup - 20, soda_white: INITIAL_INVENTORY.soda_white - 120, peach_pieces: INITIAL_INVENTORY.peach_pieces - 1 } as any, "白桃スカッシュ / さっぱり");
-    eq("白桃さっぱり 1杯作成後 max", after, before - 1);
+    // 追加: 白桃さっぱり1杯差し引きで max が1減る
+    const afterOne = { ...INITIAL_INVENTORY, white_peach_syrup: INITIAL_INVENTORY.white_peach_syrup - 20, soda_white: INITIAL_INVENTORY.soda_white - 120, peach_pieces: INITIAL_INVENTORY.peach_pieces - 1 } as typeof INITIAL_INVENTORY;
+    eq("白桃さっぱり 1杯後 max", servingsLeftWith(afterOne as any, "白桃スカッシュ / さっぱり"), 39);
     // eslint-disable-next-line no-console
     console.table(results);
   }, []);
@@ -371,7 +415,7 @@ export default function App() {
           </div>
           <div className="flex items-center gap-2">
             <button onClick={() => setEditMode((v) => !v)} className={`px-4 py-2 rounded-2xl shadow ${editMode ? "bg-amber-600 hover:bg-amber-700 text-white" : "bg-white hover:bg-neutral-100 text-neutral-900"}`}>{editMode ? "在庫編集: ON" : "在庫編集: OFF"}</button>
-            <button onClick={resetAll} className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow">リセット</button>
+            <button onClick={resetAll} className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow" disabled={syncBusy}>リセット</button>
           </div>
         </header>
 
@@ -383,7 +427,7 @@ export default function App() {
             <input className="px-2 py-2 rounded border" placeholder="Room ID（英数・長め推奨）" value={roomId} onChange={(e) => setRoomId(e.target.value)} />
             <button className={`px-4 py-2 rounded ${connected ? 'bg-emerald-600 text-white' : 'bg-neutral-900 text-white'}`} onClick={connectSupabase}>{connected ? '接続中' : '接続'}</button>
           </div>
-          <p className="text-xs text-neutral-500 mt-1">※ Room ID を知っている人と同期されます。推測されにくい長いIDを使ってください。</p>
+          <p className="text-xs text-neutral-500 mt-1">※ だれかが送信を開始すると全端末で「同期中」表示になり、完了で解除されます（ソフトロック）。</p>
         </section>
 
         {/* 売上・原価サマリー */}
@@ -427,9 +471,8 @@ export default function App() {
 
                 {/* アクション */}
                 {(() => {
-                  const controlsDisabled = syncBusy;
-                  const disabledMake = !ok || controlsDisabled;
-                  const disabledUndo = (counts[key] || 0) === 0 || controlsDisabled;
+                  const disabledMake = !ok || syncBusy;
+                  const disabledUndo = (counts[key] || 0) === 0 || syncBusy;
                   return (
                     <div className="mt-auto flex gap-2">
                       <button
