@@ -81,6 +81,8 @@ const LS_COUNTS = "mt_counts";
 const LS_SYNC = "mt_sync";
 const LS_VER = "mt_ver";
 const LS_CLIENT = "mt_client";
+// NEW: 自動再接続フラグ
+const LS_AUTOCONN = "mt_autoconn"; // '1' で自動再接続
 
 // ====== Supabase (optional / lazy import) ======
 let createClient: any | null = null;
@@ -128,7 +130,12 @@ export default function App() {
   const [sbUrl, setSbUrl] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').url || ''; } catch { return ''; } });
   const [sbKey, setSbKey] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').key || ''; } catch { return ''; } });
   const [roomId, setRoomId] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').room || ''; } catch { return ''; } });
-  const [connected, setConnected] = useState(false);
+
+  // 接続ボタンの初期表示は「自動再接続フラグ」に従う
+  const [connected, setConnected] = useState<boolean>(() => {
+    try { return localStorage.getItem(LS_AUTOCONN) === '1'; } catch { return false; }
+  });
+
   const supabaseRef = useRef<any>(null);
   const versionRef = useRef<number>(0);
   const subscriptionRef = useRef<any>(null);
@@ -292,48 +299,79 @@ export default function App() {
     ...(partial || {}),
   });
 
-  const connectSupabase = async () => {
-    const cc = await loadSupabase();
-    if (!cc) { alert(`supabase-js が見つかりません。
-npm i @supabase/supabase-js を実行してください。`); return; }
-    if (!sbUrl || !sbKey || !roomId) { alert('Supabase URL / anon key / Room ID を入力してください'); return; }
-    const sb = cc(sbUrl, sbKey);
-    supabaseRef.current = sb;
-    setConnected(true);
+  const clearAutoConn = () => {
+    try { localStorage.removeItem(LS_AUTOCONN); } catch {}
+    setConnected(false);
+  };
 
-    startSync('接続中…');
+  const setAutoConnOn = () => {
+    try { localStorage.setItem(LS_AUTOCONN, '1'); } catch {}
+  };
 
-    const { data: got } = await sb.from('rooms').select('id,payload').eq('id', roomId).maybeSingle();
-    if (got && got.payload) {
-      const remote = got.payload as RemotePayload;
-      const remoteVer = Number(remote?.version || 0);
-      if (remoteVer > version) {
-        setInventory(remote.inventory); setBaseline(remote.baseline); setCounts(remote.counts); setVersion(remoteVer);
+  const connectSupabase = async (): Promise<boolean> => {
+    try {
+      const cc = await loadSupabase();
+      if (!cc) {
+        alert(`supabase-js が見つかりません。\nnpm i @supabase/supabase-js を実行してください。`);
+        clearAutoConn();
+        return false;
       }
-    } else {
-      await sb.from('rooms').upsert({ id: roomId, payload: buildPayload() }, { onConflict: 'id' });
-    }
+      if (!sbUrl || !sbKey || !roomId) {
+        alert('Supabase URL / anon key / Room ID を入力してください');
+        clearAutoConn();
+        return false;
+      }
 
-    // Realtime 購読
-    if (subscriptionRef.current) sb.removeChannel(subscriptionRef.current);
-    const handler = (ev: any) => {
-      try {
-        const remote = ev?.new?.payload as any;
-        if (!remote) return;
+      // UI はすでに「接続中」表示の可能性あり
+      const sb = cc(sbUrl, sbKey);
+      supabaseRef.current = sb;
+      setConnected(true);
+      startSync('接続中…');
+
+      const { data: got, error: selErr } = await sb.from('rooms').select('id,payload').eq('id', roomId).maybeSingle();
+      if (selErr) {
+        console.error(selErr);
+      }
+      if (got && (got as any).payload) {
+        const remote = (got as any).payload as RemotePayload;
         const remoteVer = Number(remote?.version || 0);
-        if (pushingRef.current) return; // 自分の反射は無視
-        if (remoteVer <= Number(versionRef.current || 0)) return; // 進んだ更新のみ再接続
-        startSync('更新が入りました。再接続します…');
-        setTimeout(() => window.location.reload(), 150);
-      } catch { /* noop */ }
-    };
-    const channel = sb
-      .channel(`rooms:${roomId}`)
-      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
-      .subscribe();
-    subscriptionRef.current = channel;
-    finishSync();
+        if (remoteVer > version) {
+          setInventory(remote.inventory); setBaseline(remote.baseline); setCounts(remote.counts); setVersion(remoteVer);
+        }
+      } else {
+        const { error: upErr } = await sb.from('rooms').upsert({ id: roomId, payload: buildPayload() }, { onConflict: 'id' });
+        if (upErr) throw upErr;
+      }
+
+      // Realtime 購読
+      if (subscriptionRef.current) sb.removeChannel(subscriptionRef.current);
+      const handler = (ev: any) => {
+        try {
+          const remote = ev?.new?.payload as any;
+          if (!remote) return;
+          const remoteVer = Number(remote?.version || 0);
+          if (pushingRef.current) return; // 自分の反射は無視
+          if (remoteVer <= Number(versionRef.current || 0)) return; // 進んだ更新のみ再接続
+          startSync('更新が入りました。再接続します…');
+          setTimeout(() => window.location.reload(), 150);
+        } catch { /* noop */ }
+      };
+      const channel = sb
+        .channel(`rooms:${roomId}`)
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
+        .subscribe();
+      subscriptionRef.current = channel;
+
+      // 成功したので自動再接続フラグ ON
+      setAutoConnOn();
+      finishSync();
+      return true;
+    } catch (e) {
+      console.error(e);
+      clearAutoConn();
+      return false;
+    }
   };
 
   // 変更時 push（ソフトロック: 送信前に busy=true を広報 → 最終状態を busy=false で確定）
@@ -367,6 +405,23 @@ npm i @supabase/supabase-js を実行してください。`); return; }
     push();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inventory, baseline, counts]);
+
+  // 自動再接続: マウント時にフラグと資格情報を確認
+  useEffect(() => {
+    const auto = (() => { try { return localStorage.getItem(LS_AUTOCONN) === '1'; } catch { return false; } })();
+    const hasCreds = !!(sbUrl && sbKey && roomId);
+    if (auto && hasCreds) {
+      // UI ちらつき防止: 先に接続中表示にしてから少し遅延して実接続
+      setConnected(true);
+      const t = setTimeout(() => {
+        connectSupabase().then((ok) => { if (!ok) clearAutoConn(); });
+      }, 120);
+      return () => clearTimeout(t);
+    } else {
+      clearAutoConn();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // フォールバック: 5秒ポーリングは停止（自動再接続方式）
   useEffect(() => { /* polling disabled */ }, []);
