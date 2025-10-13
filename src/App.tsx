@@ -5,6 +5,62 @@ import { useEffect, useMemo, useRef, useState } from "react";
 // - 最初に送信を“宣言”した端末が勝ち（soft lock）。完了でロック解除 → 全端末再開
 // - 追加: 自動再接続（LS_AUTOCONN）/ 他端末更新を**ページ再読込なし**で反映 / スクロール位置の保存復元（手動再読込時）
 
+// ==== 印刷プレビュー用のスタイルをJSXで注入 ====
+const PrintStyles = () => (
+  <style>{`
+    @media print {
+      /* ブラウザが色を落とさないように */
+      * {
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+      }
+
+      html, body {
+        background: #ffffff !important;
+        color: #111827 !important; /* neutral-900 相当 */
+      }
+
+      /* 画面専用の余白や最小高さを抑える */
+      .min-h-screen { min-height: auto !important; }
+      .p-6 { padding: 12px !important; }
+
+      /* 背景色が飛ぶのを軽減（完全再現はプリンタ依存） */
+      .bg-white { background: #ffffff !important; }
+      .bg-neutral-50 { background: #f9fafb !important; } /* 近似色 */
+
+      /* シャドウは印刷で弱くなるので薄い線も補助的に入れる */
+      .shadow, .shadow-lg, .shadow-xl {
+        box-shadow: 0 1px 4px rgba(0,0,0,.12) !important;
+        -webkit-box-shadow: 0 1px 4px rgba(0,0,0,.12) !important;
+        border: 1px solid #e5e7eb !important; /* neutral-200 */
+      }
+
+      /* 角丸が消えがちなので強制上書き */
+      .rounded-xl { border-radius: 0.75rem !important; }
+      .rounded-2xl { border-radius: 1rem !important; }
+
+      /* グリッドの詰まり対策 */
+      .grid { gap: 12px !important; }
+
+      /* カード途中での改ページを避ける */
+      .bg-white, .rounded-xl, .rounded-2xl {
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+
+      /* 進捗トーストなどの固定要素は印刷に不要なら隠す */
+      .fixed { display: none !important; }
+
+      /* 入力境界線を明確にする（在庫編集ON時の見やすさ用） */
+      input, button, select, textarea {
+        border-color: #d1d5db !important; /* neutral-300 */
+        color: #111827 !important;
+      }
+    }
+  `}</style>
+);
+
+
 // ==== 売価設定 ====
 const PRICE_PER_CUP = 300; // 円
 
@@ -525,7 +581,9 @@ export default function App() {
   }, []);
 
   return (
-    <div className="min-h-screen bg-neutral-50 text-neutral-900 p-6">
+    <>
+     <PrintStyles />
+     <div className="min-h-screen bg-neutral-50 text-neutral-900 p-6">
       <div className="max-w-6xl mx-auto">
         <header className="flex items-start justify-between gap-4 mb-6">
           <div>
@@ -552,17 +610,25 @@ export default function App() {
         </section>
 
         {/* 売上・原価サマリー */}
-        <section className="mb-6">
-          <div className="grid md:grid-cols-4 gap-2 text-sm">
-            <div className="bg-white rounded-xl p-3 shadow flex justify-between"><span>売価(1杯)</span><span className="font-mono">¥{PRICE_PER_CUP}</span></div>
-            <div className="bg-white rounded-xl p-3 shadow flex justify-between"><span>合計杯数</span><span className="font-mono">{totals.cups}</span></div>
-            <div className="bg-white rounded-xl p-3 shadow flex justify-between"><span>売上</span><span className="font-mono">¥{totals.revenue}</span></div>
-            <div className="bg-white rounded-xl p-3 shadow flex justify-between"><span>合計原価</span><span className="font-mono">¥{totals.cogs}</span></div>
-          </div>
-          <div className="grid md:grid-cols-2 gap-2 mt-2 text-sm">
-            <div className="bg-white rounded-xl p-3 shadow flex justify-between"><span>粗利</span><span className="font-mono">¥{totals.gp}</span></div>
-            <div className="bg-white rounded-xl p-3 shadow flex justify-between"><span>粗利率</span><span className="font-mono">{(totals.margin * 100).toFixed(1)}%</span></div>
-          </div>
+	<section className="mb-6">
+  	 <div className="grid md:grid-cols-4 gap-2 text-sm">
+    	  <div className="bg-white rounded-xl p-3 shadow flex justify-between">
+      	   <span>売価(1杯)</span>
+      	   <span className="font-mono">¥{PRICE_PER_CUP}</span>
+    	  </div>
+    	  <div className="bg-white rounded-xl p-3 shadow flex justify-between">
+      	   <span>合計杯数</span>
+      	   <span className="font-mono">{totals.cups}</span>
+    	 </div>
+    	 <div className="bg-white rounded-xl p-3 shadow flex justify-between">
+      	   <span>売上</span>
+      	   <span className="font-mono">¥{totals.revenue}</span>
+    	 </div>
+    	 <div className="bg-white rounded-xl p-3 shadow flex justify-between">
+      	   <span>合計原価</span>
+      	   <span className="font-mono">¥{totals.cogs}</span>
+    	 </div>
+ 	 </div>
         </section>
 
         {/* バリエーション一覧 */}
@@ -683,5 +749,6 @@ export default function App() {
         )}
       </div>
     </div>
+   </>
   );
 }
