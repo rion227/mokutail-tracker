@@ -244,8 +244,42 @@ export default function App() {
     setBaseline((prev: Baseline) => ({ ...prev, [key]: Math.max((prev as any)[key] ?? 0, nextVal) } as Baseline));
   };
 
+  // ===== 早出しロック + プリフライト =====
+  const clientId = useRef<string>(ensureClientId());
+  const pushingRef = useRef(false);
+  const earlyAnnouncedRef = useRef(false);
+
+  const earlyAnnounce = async () => {
+    if (!connected || !supabaseRef.current || !roomId || earlyAnnouncedRef.current) return;
+    earlyAnnouncedRef.current = true;
+    pushingRef.current = true;          // 自端末も一瞬ロック
+    startSync('同期中…', 1000);        // 既存の小ポップを流用
+    const sb = supabaseRef.current;
+    const announce = buildPayload({ sync: { busy: true, owner: clientId.current, started_at: Date.now() } });
+    // fire-and-forget で十分（awaitでも可）
+    sb.from('rooms').upsert({ id: roomId, payload: announce }, { onConflict: 'id' });
+  };
+
+  const preflightOrBlock = async (): Promise<boolean> => {
+    if (!connected || !supabaseRef.current || !roomId) return true; // 非接続はそのまま通す
+    if (lockActive) return false; // 既にロック中
+    const sb = supabaseRef.current;
+    const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
+    const remote = data?.payload as RemotePayload | undefined;
+    if (remote?.sync?.busy && remote.sync.owner !== clientId.current) {
+      const started = Number(remote.sync.started_at || 0);
+      const until = started + LOCK_TTL_MS;
+      markLockedUntil(until);
+      startSync('同期中…', Math.max(600, until - Date.now()));
+      return false;
+    }
+    await earlyAnnounce(); // すり抜け前に自分がロックを配信
+    return true;
+  };
+
   // ---- actions ----
-  const makeOne = (recipeKey: string) => {
+  const makeOne = async (recipeKey: string) => {
+    if (!(await preflightOrBlock())) return;
     localDirtyRef.current = true;
     const check = canMake(recipeKey);
     if (!check.ok || actionsBlocked()) return;
@@ -258,7 +292,8 @@ export default function App() {
     setCounts((prev: Counts) => ({ ...prev, [recipeKey]: (prev[recipeKey] || 0) + 1 }));
   };
 
-  const undoOne = (recipeKey: string) => {
+  const undoOne = async (recipeKey: string) => {
+    if (!(await preflightOrBlock())) return;
     localDirtyRef.current = true;
     if (actionsBlocked()) return;
     setCounts((prev: Counts) => { const cur = prev[recipeKey] || 0; if (cur <= 0) return prev; return { ...prev, [recipeKey]: cur - 1 }; });
@@ -270,7 +305,8 @@ export default function App() {
     });
   };
 
-  const resetAll = () => {
+  const resetAll = async () => {
+    if (!(await preflightOrBlock())) return;
     localDirtyRef.current = true;
     if (actionsBlocked()) return;
     setInventory(INITIAL_INVENTORY);
@@ -342,9 +378,6 @@ export default function App() {
   }, [counts, perCupCost]);
 
   // ====== ソフトロック付き同期 ======
-  const clientId = useRef<string>(ensureClientId());
-  const pushingRef = useRef(false);
-
   type RemotePayload = {
     inventory: Inventory;
     baseline: Baseline;
@@ -522,7 +555,7 @@ export default function App() {
         localDirtyRef.current = false;
         // ユーザーに明示（小ポップに加えて中央モーダル）
         setShowRetryModal(true);
-        setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
+        setTimeout(() => { earlyAnnouncedRef.current = false; pushingRef.current = false; finishSync(); }, 120);
         return;
       }
 
@@ -538,14 +571,14 @@ export default function App() {
         localDirtyRef.current = false; // この操作はキャンセル扱い（次の操作で正しいベースから送られる）
         // ユーザーに明示（小ポップに加えて中央モーダル）
         setShowRetryModal(true);
-        setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
+        setTimeout(() => { earlyAnnouncedRef.current = false; pushingRef.current = false; finishSync(); }, 120);
         return;
       }
 
       // CAS成功：手元のversionも進める（読後一致）
       setVersion(nextVersion);
       localDirtyRef.current = false;
-      setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
+      setTimeout(() => { earlyAnnouncedRef.current = false; pushingRef.current = false; finishSync(); }, 120);
     };
     push();
     // eslint-disable-next-line react-hooks/exhaustive-deps
