@@ -272,6 +272,8 @@ export default function App() {
       const until = started + LOCK_TTL_MS;
       markLockedUntil(until);
       startSync('同期中…', Math.max(600, until - Date.now()));
+      // 他端末の同期中 → 自分の操作は弾く＋モーダルで明示
+      setShowRetryModal(true);
       return false;
     }
     await earlyAnnounce(); // すり抜け前に自分がロックを配信
