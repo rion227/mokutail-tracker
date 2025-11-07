@@ -485,19 +485,60 @@ export default function App() {
         return;
       }
 
-      // 自分がロック告知
-      const announce = buildPayload({ sync: { busy: true, owner: clientId.current, started_at: Date.now() } });
+      // ---- CAS（Compare-And-Swap）で条件付き更新 ----
+      // 期待する現在版（手元のversion）
+      const expected = Number(version) || 0;
+      const nextVersion = expected + 1;
+      // 送信開始の小ポップ（1秒）
       pushingRef.current = true;
-      // 自端末側の送信開始時も1秒だけ小ポップ
       startSync('同期中…', 1000);
+
+      // (任意) busy 告知は維持。見た目用に1秒ロックさせたい場合は残す
+      const announce = buildPayload({ sync: { busy: true, owner: clientId.current, started_at: Date.now() } });
       await sb.from('rooms').upsert({ id: roomId, payload: announce }, { onConflict: 'id' });
 
-      // 最終状態をコミット（busy=false）
-      const nextVersion = Number(version) + 1;
+      // 最終スナップショット（version を +1 済み）
       const finalPayload = buildPayload({ version: nextVersion, sync: { busy: false, owner: clientId.current, started_at: Date.now() } });
-      await sb.from('rooms').upsert({ id: roomId, payload: finalPayload }, { onConflict: 'id' });
+
+      // 条件付き UPDATE: payload->>version = expected のときだけ更新
+      const { data: upd, error: casErr } = await sb
+        .from('rooms')
+        .update({ payload: finalPayload })
+        .eq('id', roomId)
+        .filter('payload->>version', 'eq', String(expected))
+        .select();
+
+      if (casErr) {
+        console.error('CAS update error', casErr);
+        // フォールバック：最新を読み直して手元を同期
+        const { data: latest } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
+        const r = latest?.payload as RemotePayload | undefined;
+        if (r) {
+          remoteApplyingRef.current = true; // 自反映ループ抑止
+          setInventory(r.inventory); setBaseline(r.baseline); setCounts(r.counts); setVersion(Number(r.version || 0));
+        }
+        localDirtyRef.current = false;
+        setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
+        return;
+      }
+
+      if (!upd || upd.length === 0) {
+        // 競合：誰かが先に version を進めた → 最新に合わせる
+        startSync('更新競合 → 最新を反映', 900);
+        const { data: latest } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
+        const r = latest?.payload as RemotePayload | undefined;
+        if (r) {
+          remoteApplyingRef.current = true;
+          setInventory(r.inventory); setBaseline(r.baseline); setCounts(r.counts); setVersion(Number(r.version || 0));
+        }
+        localDirtyRef.current = false; // この操作はキャンセル扱い（次の操作で正しいベースから送られる）
+        setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
+        return;
+      }
+
+      // CAS成功：手元のversionも進める（読後一致）
       setVersion(nextVersion);
-      localDirtyRef.current = false; // ローカル変更を消化
+      localDirtyRef.current = false;
       setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
     };
     push();
