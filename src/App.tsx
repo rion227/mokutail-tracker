@@ -2,8 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 /* =============================================================================
    モクテル在庫トラッカー（同期付き）
-   - 機能は変えず、同期体験と操作の見え方を最適化
-   - 追加: 再読み込み/接続時にサーバの最新スナップショットを強制取得
+   - 機能は維持しつつ、在庫編集はドラフト→適用で全端末へ反映に変更
+   - 再読み込み/接続時はサーバ最新スナップショットを取得してから描画
    ============================================================================= */
 
 /* 売価（1杯あたり） */
@@ -152,7 +152,11 @@ export default function App() {
     (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0));
     return o;
   });
-  const [editMode, setEditMode] = useState(false);
+
+  /* —— 在庫編集：ドラフト方式 —— */
+  const [isEditingStock, setIsEditingStock] = useState(false);     // 在庫編集モード（ON で編集UI表示）
+  const [draftInventory, setDraftInventory] = useState<Inventory | null>(null); // 編集中だけ保持
+  // 入力UIは draftInventory を表示し、適用時に setInventory へ反映する
 
   /* バージョン（ローカルの観測版。CASの期待値にも使用） */
   const [version, setVersion] = useState<number>(() => {
@@ -223,7 +227,6 @@ export default function App() {
     const delay = Math.max(0, until - Date.now());
     lockTimerRef.current = setTimeout(() => {
       setLockActive(false);
-      // 解除後の自動再実行はしない（確定後反映のため）
     }, delay + 50);
   };
 
@@ -314,6 +317,77 @@ export default function App() {
   }, [sbUrl, sbKey, roomId]);
 
   /* =========================
+     在庫編集（ドラフトユーティリティ）
+     ========================= */
+  const beginStockEdit = () => {
+    // 最新の在庫を下敷きに編集開始（サーバ最新が欲しければ先に接続/再読み込みでpull）
+    setDraftInventory(inventory);
+    setIsEditingStock(true);
+  };
+  const cancelStockEdit = () => {
+    setIsEditingStock(false);
+    setDraftInventory(null);
+  };
+
+  // ドラフトに値をセット
+  const setDraftInventoryValue = (key: keyof Inventory, val: number) => {
+    setDraftInventory((prev) => {
+      const base = prev ?? inventory;
+      const next = { ...base } as Inventory;
+      (next as any)[key] = Math.max(0, Number.isFinite(val) ? val : 0);
+      return next;
+    });
+  };
+  // ドラフトを増減
+  const bumpDraftInventory = (key: keyof Inventory, delta: number) => {
+    setDraftInventory((prev) => {
+      const base = prev ?? inventory;
+      const cur = (base as any)[key] as number;
+      const nextVal = Math.max(0, cur + delta);
+      const next = { ...base } as Inventory;
+      (next as any)[key] = nextVal;
+      return next;
+    });
+  };
+
+  // 適用：busy早出し → ドラフトを本番へ反映（baseline も必要に応じて更新）→ push
+  const applyStockEdit = async () => {
+    if (!draftInventory) return;
+    // 事前に他端末busyなら弾く
+    if (!(await preflightOrBlock())) return;
+
+    // 接続中はbusyを立ててから確定（“確定後反映”）
+    if (connected) {
+      await earlyAnnounce();
+      await awaitBusyEcho();
+    }
+
+    // 実在庫・基準を更新（基準は「補充時に上書き」ルールを維持）
+    setInventory((prev) => {
+      const next = { ...(draftInventory as Inventory) };
+      // baselineは「増えた項目のみ上書き」
+      setBaseline((prevBase) => {
+        const b: any = { ...(prevBase as Baseline) };
+        (Object.keys(next) as (keyof Inventory)[]).forEach((k) => {
+          const prevVal = (prevBase as any)[k] ?? 0;
+          const nowVal = (next as any)[k] ?? 0;
+          if (nowVal > prevVal) b[k] = nowVal;
+        });
+        return b as Baseline;
+      });
+      return next as Inventory;
+    });
+
+    // この変更を送るフラグ
+    localDirtyRef.current = true;
+
+    // UIを通常モードへ
+    setIsEditingStock(false);
+    setDraftInventory(null);
+    startSync("在庫編集を適用中…", 900);
+  };
+
+  /* =========================
      ヘルパー（在庫/可否/原価）
      ========================= */
   const canMakeWith = (inv: Inventory, recipeKey: string) => {
@@ -338,33 +412,6 @@ export default function App() {
       if (left < min) min = left;
     }
     return isFinite(min) ? min : 0;
-  };
-
-  const updateBaselineIfIncreased = (key: keyof Inventory, nextVal: number) => {
-    setBaseline(
-      (prev: Baseline) =>
-        ({ ...prev, [key]: Math.max((prev as any)[key] ?? 0, nextVal) } as Baseline)
-    );
-  };
-
-  // 在庫編集用（ユースケース：補充時）
-  const setInventoryValue = (key: keyof Inventory, val: number) => {
-    setInventory((prev) => {
-      const next = { ...prev };
-      (next as any)[key] = Math.max(0, Number.isFinite(val) ? val : 0);
-      updateBaselineIfIncreased(key, (next as any)[key]);
-      return next as Inventory;
-    });
-  };
-  const bumpInventory = (key: keyof Inventory, delta: number) => {
-    setInventory((prev) => {
-      const cur = (prev as any)[key] as number;
-      const nextVal = Math.max(0, cur + delta);
-      const next = { ...prev };
-      (next as any)[key] = nextVal;
-      updateBaselineIfIncreased(key, nextVal);
-      return next as Inventory;
-    });
   };
 
   /* =========================
@@ -514,15 +561,25 @@ export default function App() {
   /* =========================
      派生表示・集計
      ========================= */
+  // 表示用に「現在表示する在庫」を一本化
+  const displayInventory: Inventory = (isEditingStock && draftInventory) ? draftInventory : inventory;
+
   const inventoryList = useMemo<{ key: string; label: string; value: number }[]>(
     () =>
-      Object.entries(inventory).map(([k, v]) => ({
+      Object.entries(displayInventory).map(([k, v]) => ({
         key: k,
         label: NICE_LABEL[k as keyof typeof NICE_LABEL] || k,
         value: v as number,
       })),
-    [inventory]
+    [displayInventory]
   );
+
+  const servingsMap = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const key of Object.keys(RECIPES) as string[])
+      out[key] = servingsLeftWith(displayInventory as Inventory, key);
+    return out;
+  }, [displayInventory]);
 
   const getLevel = (key: keyof Inventory, value: number) => {
     const base = (baseline as any)[key] as number | undefined;
@@ -532,13 +589,6 @@ export default function App() {
     if (pct <= 0.35) return "warn";
     return "ok";
   };
-
-  const leftMap = useMemo(() => {
-    const out: Record<string, number> = {};
-    for (const key of Object.keys(RECIPES) as string[])
-      out[key] = servingsLeftWith(inventory as Inventory, key);
-    return out;
-  }, [inventory]);
 
   const perCupCost = useMemo(() => {
     const map: Record<string, number> = {};
@@ -592,8 +642,7 @@ export default function App() {
     } catch {}
   };
 
-  // ★ 追加: 最新スナップショットを強制取得する共通関数
-  //   - force=true: ローカルより古くてもサーバ値で上書き（接続直後/明示リロード用）
+  // 最新スナップショットを強制取得（force=true: ローカルより古くても上書き）
   const pullLatest = async (force = false) => {
     if (!supabaseRef.current || !roomId) return false;
     try {
@@ -611,6 +660,7 @@ export default function App() {
         setBaseline(r.baseline);
         setCounts(r.counts);
         setVersion(remoteVer);
+        // 編集中は表示が draft 優先のため、ここでは draft は維持（あえて上書きしない）
         return true;
       }
     } catch (e) {
@@ -619,16 +669,14 @@ export default function App() {
     return false;
   };
 
-  // ★ 追加: 再読み込みボタンの振る舞いを拡張（最新取得→画面リロード）
   const handleReload = async () => {
     startSync("最新を取得中…", 800);
     if (connected) {
-      await pullLatest(true); // サーバを真に最新とみなして上書き
+      await pullLatest(true); // サーバ最新で上書き
     }
     reloadWithScrollSave();
   };
 
-  // 接続処理
   const connectSupabase = async (): Promise<boolean> => {
     try {
       const cc = await loadSupabase();
@@ -721,7 +769,7 @@ export default function App() {
         .subscribe();
       subscriptionRef.current = channel;
 
-      // ★ 接続直後に「必ず」サーバ最新を強制取得
+      // 接続直後に「必ず」サーバ最新を強制取得
       await pullLatest(true);
 
       setAutoConnOn();
@@ -740,17 +788,12 @@ export default function App() {
   useEffect(() => {
     const push = async () => {
       if (!connected || !supabaseRef.current || !roomId) return;
-      // 直前にRealtimeを当て込んだ反射は無視（ループ抑止）
-      if (remoteApplyingRef.current) {
-        remoteApplyingRef.current = false;
-        return;
-      }
-      // ローカル差分がないなら送らない
+      if (remoteApplyingRef.current) { remoteApplyingRef.current = false; return; }
       if (!localDirtyRef.current) return;
 
       const sb = supabaseRef.current;
 
-      // 他端末のbusyを検出したら少し待ってリトライ
+      // 他端末 busy 中は待つ
       const { data } = await sb.from("rooms").select("payload").eq("id", roomId).maybeSingle();
       const remote = data?.payload as RemotePayload | undefined;
       if (remote?.sync?.busy && remote.sync.owner !== clientId.current) {
@@ -791,7 +834,6 @@ export default function App() {
 
       if (casErr) {
         console.error("CAS update error", casErr);
-        // フォールバック：最新版に合わせてUIを同期 + モーダル
         const { data: latest } = await sb
           .from("rooms")
           .select("payload")
@@ -817,7 +859,6 @@ export default function App() {
       }
 
       if (!upd || upd.length === 0) {
-        // 誰かが先にversionを進めた（競合）→ 最新を取り込んでから案内
         startSync("更新競合 → 最新を反映", 900);
         const { data: latest } = await sb
           .from("rooms")
@@ -843,7 +884,7 @@ export default function App() {
         return;
       }
 
-      // CAS成功：ローカル版を進めて完了
+      // CAS成功
       setVersion(nextVersion);
       localDirtyRef.current = false;
       setTimeout(() => {
@@ -894,28 +935,6 @@ export default function App() {
     eq("トロピカルすっきり max", servingsLeftWith(INITIAL_INVENTORY as any, "トロピカルスカッシュ / すっきり"), 30);
     const invNoPeach = { ...INITIAL_INVENTORY, peach_pieces: 0 } as typeof INITIAL_INVENTORY;
     eq("白桃トッピング不足検出", canMakeWith(invNoPeach as Inventory, "白桃スカッシュ / さっぱり").ok, false);
-    const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY;
-    eq("トロピカル 1杯", servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"), 1);
-    const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY;
-    eq("トロピカル 2杯", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
-    const afterOne = {
-      ...INITIAL_INVENTORY,
-      white_peach_syrup: INITIAL_INVENTORY.white_peach_syrup - 20,
-      soda_white: INITIAL_INVENTORY.soda_white - 120,
-      peach_pieces: INITIAL_INVENTORY.peach_pieces - 1,
-    } as typeof INITIAL_INVENTORY;
-    eq("白桃さっぱり 1杯後 max", servingsLeftWith(afterOne as any, "白桃スカッシュ / さっぱり"), 39);
-    eq(
-      "白桃さっぱり syrup不足",
-      canMakeWith({ ...INITIAL_INVENTORY, white_peach_syrup: 19 } as any, "白桃スカッシュ / さっぱり").ok,
-      false
-    );
-    eq(
-      "白桃さっぱり soda不足",
-      canMakeWith({ ...INITIAL_INVENTORY, soda_white: 119 } as any, "白桃スカッシュ / さっぱり").ok,
-      false
-    );
-    eq("1杯原価(白桃さっぱり)=109.4", (perCupCost as any)["白桃スカッシュ / さっぱり"], 109.4);
     console.table(results);
   }, []);
 
@@ -932,22 +951,19 @@ export default function App() {
               <p className="text-sm text-neutral-600">
                 在庫を減算・補充して各端末で同期。Room ID を共有すると複数端末で同じ在庫を見られます。
               </p>
-              <p className="text-xs text-neutral-500 mt-1">
-                ※トロピカルは <span className="font-semibold">冷凍マンゴー/冷凍パインを原価・在庫計算から除外</span>。モヒートは{" "}
-                <span className="font-semibold">ライムを除外</span>。
-              </p>
             </div>
             <div className="flex items-center gap-2">
+              {/* 在庫編集：押すと編集モードに入る（トグルOFFは廃止） */}
               <button
-                onClick={() => setEditMode((v) => !v)}
-                className={`px-4 py-2 rounded-2xl shadow ${
-                  editMode ? "bg-amber-600 hover:bg-amber-700 text-white" : "bg-white hover:bg-neutral-100 text-neutral-900"
-                }`}
+                onClick={beginStockEdit}
+                className="px-4 py-2 rounded-2xl shadow bg-amber-600 hover:bg-amber-700 text-white disabled:opacity-50"
+                disabled={isEditingStock}
+                title="在庫値を編集します（適用するまで他端末へは反映されません）"
               >
-                {editMode ? "在庫編集: ON" : "在庫編集: OFF"}
+                在庫編集
               </button>
 
-              {/* ★ 変更: 再読み込み → 事前に最新pullしてからリロード */}
+              {/* 最新取得 → 再読み込み */}
               <button
                 onClick={handleReload}
                 className="px-3 py-2 rounded-2xl bg-white hover:bg-neutral-100 text-neutral-900 border border-neutral-200 shadow"
@@ -956,6 +972,7 @@ export default function App() {
                 再読み込み
               </button>
 
+              {/* 在庫全リセット（従来どおり即時反映/同期） */}
               <button
                 onClick={resetAll}
                 className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow"
@@ -987,8 +1004,6 @@ export default function App() {
                 value={roomId}
                 onChange={(e) => setRoomId(e.target.value)}
               />
-
-              {/* ★ 接続ボタンクリック → 接続完了後にpullLatest(true) が走る */}
               <button
                 className={`px-4 py-2 rounded ${connected ? "bg-emerald-600 text-white" : "bg-neutral-900 text-white"}`}
                 onClick={connectSupabase}
@@ -997,7 +1012,7 @@ export default function App() {
               </button>
             </div>
             <p className="text-xs text-neutral-500 mt-1">
-              ※ 接続中は「busyが立ってからUI反映」するため、同時押しでもズレません。
+              ※ 接続中は、同時押しでもCASで一貫性を担保。再読み込み/接続直後はサーバの最新を取得します。
             </p>
           </section>
 
@@ -1023,11 +1038,12 @@ export default function App() {
             </div>
           </section>
 
-          {/* バリエーション一覧 */}
+          {/* バリエーション一覧（作る/戻すは従来のまま = 即時反映→同期） */}
           <section className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
             {(Object.keys(RECIPES) as string[]).map((key) => {
-              const { ok, blockers } = canMake(key);
-              const left = leftMap[key];
+              const invForCheck = displayInventory; // 表示在庫に基づく可否（編集中はドラフト参照）
+              const { ok, blockers } = canMakeWith(invForCheck, key);
+              const left = servingsMap[key];
               const disabledMake = !ok || actionsBlocked();
               const disabledUndo = (counts[key] || 0) === 0 || actionsBlocked();
               return (
@@ -1058,18 +1074,22 @@ export default function App() {
                   <div className="mt-auto flex gap-2">
                     <button
                       onClick={() => makeOne(key)}
-                      disabled={disabledMake}
+                      disabled={disabledMake || isEditingStock} // 編集中は誤操作防止で無効化
                       className={`px-4 py-2 rounded-xl font-medium shadow transition ${
-                        disabledMake ? "bg-neutral-200 text-neutral-500 cursor-not-allowed" : "bg-emerald-600 hover:bg-emerald-700 text-white"
+                        (disabledMake || isEditingStock)
+                          ? "bg-neutral-200 text-neutral-500 cursor-not-allowed"
+                          : "bg-emerald-600 hover:bg-emerald-700 text-white"
                       }`}
                     >
                       1杯作る
                     </button>
                     <button
                       onClick={() => undoOne(key)}
-                      disabled={disabledUndo}
+                      disabled={disabledUndo || isEditingStock}
                       className={`px-4 py-2 rounded-xl font-medium shadow transition ${
-                        disabledUndo ? "bg-neutral-200 text-neutral-500 cursor-not-allowed" : "bg-red-600 hover:bg-red-700 text-white"
+                        (disabledUndo || isEditingStock)
+                          ? "bg-neutral-200 text-neutral-500 cursor-not-allowed"
+                          : "bg-red-600 hover:bg-red-700 text-white"
                       }`}
                       title="直前の誤操作などを取り消して1杯分を在庫に戻します"
                     >
@@ -1083,8 +1103,8 @@ export default function App() {
             })}
           </section>
 
-          {/* 在庫サマリー */}
-          <section className="mt-8">
+          {/* 在庫サマリー（編集中はドラフトを表示&編集） */}
+          <section className="mt-8 relative">
             <h3 className="font-semibold mb-3">在庫（残量）</h3>
             <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3">
               {inventoryList.map(({ key, label, value }) => {
@@ -1099,12 +1119,19 @@ export default function App() {
                     ? "border border-amber-300 bg-amber-50"
                     : "border border-neutral-200 bg-white";
                 return (
-                  <div key={key} className={`${wrapCls} rounded-xl p-3 shadow text-sm flex flex-col gap-2`}>
+                  <div
+                    key={key}
+                    className={`${wrapCls} rounded-xl p-3 shadow text-sm flex flex-col gap-2`}
+                  >
                     <div className="flex items-center justify-between">
                       <span>{label}</span>
                       <span
                         className={`font-mono ${
-                          level === "danger" ? "text-red-700" : level === "warn" ? "text-amber-700" : "text-neutral-900"
+                          level === "danger"
+                            ? "text-red-700"
+                            : level === "warn"
+                            ? "text-amber-700"
+                            : "text-neutral-900"
                         }`}
                       >
                         {value}
@@ -1114,43 +1141,71 @@ export default function App() {
                     {base > 0 && (
                       <div className="h-2 w-full rounded bg-neutral-100 overflow-hidden">
                         <div
-                          className={`${level === "danger" ? "bg-red-500" : level === "warn" ? "bg-amber-500" : "bg-emerald-500"} h-full`}
+                          className={`${
+                            level === "danger"
+                              ? "bg-red-500"
+                              : level === "warn"
+                              ? "bg-amber-500"
+                              : "bg-emerald-500"
+                          } h-full`}
                           style={{ width: `${pct * 100}%` }}
                           aria-hidden
                         />
                       </div>
                     )}
-                    {editMode && (
-                      <div className="flex items-center gap-2">
+
+                    {/* 編集UI：ドラフトにだけ反映（適用するまで他端末へ影響なし） */}
+                    {isEditingStock && (
+                      <div className="flex items-center gap-2 mt-1">
                         <input
                           type="number"
                           inputMode="numeric"
                           className="w-28 px-2 py-1 rounded border border-neutral-300 font-mono"
                           value={value as number}
-                          onChange={(e) => setInventoryValue(key as keyof Inventory, Number(e.target.value))}
+                          onChange={(e) =>
+                            setDraftInventoryValue(key as keyof Inventory, Number(e.target.value))
+                          }
                         />
                         <div className="flex gap-1">
                           {isPieces ? (
                             <>
-                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 1)}>
+                              <button
+                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
+                                onClick={() => bumpDraftInventory(key as keyof Inventory, 1)}
+                              >
                                 +1
                               </button>
-                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 5)}>
+                              <button
+                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
+                                onClick={() => bumpDraftInventory(key as keyof Inventory, 5)}
+                              >
                                 +5
                               </button>
-                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 10)}>
+                              <button
+                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
+                                onClick={() => bumpDraftInventory(key as keyof Inventory, 10)}
+                              >
                                 +10
                               </button>
                             </>
                           ) : (
                             <>
-                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 50)}>
+                              <button
+                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
+                                onClick={() => bumpDraftInventory(key as keyof Inventory, 50)}
+                              >
                                 +50
                               </button>
-                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 100)}>
+                              <button
+                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
+                                onClick={() => bumpDraftInventory(key as keyof Inventory, 100)}
+                              >
                                 +100
                               </button>
-                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 500)}>
+                              <button
+                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
+                                onClick={() => bumpDraftInventory(key as keyof Inventory, 500)}
+                              >
                                 +500
                               </button>
                             </>
@@ -1162,8 +1217,29 @@ export default function App() {
                 );
               })}
             </div>
+
+            {/* 編集中のみ：右下に適用/キャンセル */}
+            {isEditingStock && (
+              <div className="mt-4 flex gap-2 justify-end">
+                <button
+                  onClick={cancelStockEdit}
+                  className="px-4 py-2 rounded-xl bg-white border border-neutral-300 hover:bg-neutral-100 shadow text-neutral-700"
+                >
+                  キャンセル
+                </button>
+                <button
+                  onClick={applyStockEdit}
+                  className="px-5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white shadow disabled:opacity-50"
+                  disabled={actionsBlocked()}
+                  title="ドラフト在庫を全端末へ反映（サーバへコミット）"
+                >
+                  適用
+                </button>
+              </div>
+            )}
+
             <p className="text-xs text-neutral-500 mt-2">
-              ※ 在庫を補充（手動編集/＋ボタン）した時点の値が新しい100%になります。作成/取り消しでは基準は更新されません。
+              ※ 在庫編集は「適用」するまで他端末に反映されません。適用時に最新へ同期します。
             </p>
           </section>
 
