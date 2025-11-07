@@ -1,9 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-// ==== 売価設定 ====
+/* =============================================================================
+   モクテル在庫トラッカー（同期付き）
+   - 機能は変えず、同期体験と操作の見え方を最適化
+   - 追加: 再読み込み/接続時にサーバの最新スナップショットを強制取得
+   ============================================================================= */
+
+/* 売価（1杯あたり） */
 const PRICE_PER_CUP = 300; // 円
 
-// ==== 原価単価（円/ml 相当）====
+/* 原価単価（円 / ml 相当） */
 const UNIT_COSTS: Record<string, number> = {
   white_peach_syrup: 1678 / 1000,
   mango_syrup: 867 / 600,
@@ -20,7 +26,7 @@ const UNIT_COSTS: Record<string, number> = {
 };
 const PEACH_GARNISH_COST = (2068 + 386) / 40;
 
-// ==== 初期在庫 ====
+/* 初期在庫 */
 const INITIAL_INVENTORY = {
   white_peach_syrup: 1000,
   mango_syrup: 600,
@@ -41,7 +47,7 @@ type Inventory = typeof INITIAL_INVENTORY;
 type Counts = Record<string, number>;
 type Baseline = typeof INITIAL_INVENTORY;
 
-// ==== レシピ ====
+/* レシピ（「カシスオレンジ / 甘め(90ml)」は削除済） */
 const RECIPES: Record<string, Record<string, number>> = {
   "白桃スカッシュ / さっぱり": { white_peach_syrup: 20, soda_white: 120, peach_pieces: 1 },
   "白桃スカッシュ / 甘め": { white_peach_syrup: 25, soda_white: 100, peach_pieces: 1 },
@@ -69,7 +75,7 @@ const NICE_LABEL: Record<string, string> = {
   peach_pieces: "白桃トッピング(個)",
 };
 
-// ==== 1杯原価（シート優先）====
+/* 1杯原価（シート優先値を固定で使用） */
 const PER_RECIPE_COSTS: Record<string, number> = {
   "白桃スカッシュ / さっぱり": 109.4,
   "白桃スカッシュ / 甘め": 115.4,
@@ -81,7 +87,7 @@ const PER_RECIPE_COSTS: Record<string, number> = {
   "カシスオレンジ / 甘め(100ml)": 119.7,
 };
 
-// === localStorage keys ===
+/* localStorage keys */
 const LS_INV = "mt_inv";
 const LS_BASE = "mt_base";
 const LS_COUNTS = "mt_counts";
@@ -90,7 +96,7 @@ const LS_VER = "mt_ver";
 const LS_CLIENT = "mt_client";
 const LS_AUTOCONN = "mt_autoconn";
 
-// ====== Supabase (optional / lazy import) ======
+/* Supabase クライアント（遅延 import） */
 let createClient: any | null = null;
 const loadSupabase = async () => {
   if (createClient) return createClient;
@@ -118,6 +124,9 @@ function ensureClientId() {
 }
 
 export default function App() {
+  /* =========================
+     ローカル状態 & 設定
+     ========================= */
   const [inventory, setInventory] = useState<Inventory>(() => {
     try {
       const raw = localStorage.getItem(LS_INV);
@@ -145,6 +154,7 @@ export default function App() {
   });
   const [editMode, setEditMode] = useState(false);
 
+  /* バージョン（ローカルの観測版。CASの期待値にも使用） */
   const [version, setVersion] = useState<number>(() => {
     try {
       return Number(localStorage.getItem(LS_VER) || "0") || 0;
@@ -153,6 +163,7 @@ export default function App() {
     }
   });
 
+  /* 接続情報 */
   const [sbUrl, setSbUrl] = useState(() => {
     try {
       return JSON.parse(localStorage.getItem(LS_SYNC) || "{}").url || "";
@@ -183,22 +194,26 @@ export default function App() {
     }
   });
 
+  /* 参照＆内部制御 */
   const supabaseRef = useRef<any>(null);
   const versionRef = useRef<number>(0);
   const subscriptionRef = useRef<any>(null);
   const applyTimerRef = useRef<any>(null);
 
-  const remoteApplyingRef = useRef(false);
-  const localDirtyRef = useRef(false);
+  const remoteApplyingRef = useRef(false); // Realtime反映ループ抑止
+  const localDirtyRef = useRef(false);     // 直近のローカル操作が未送信
 
-  // --- lock (busy) ---
-  const LOCK_TTL_MS = 1000;
+  /* =========================
+     早出しロック（busy）制御
+     ========================= */
+  const LOCK_TTL_MS = 1000; // 1秒ロック
   const lockUntilRef = useRef<number>(0);
   const [lockActive, setLockActive] = useState(false);
   const lockTimerRef = useRef<any>(null);
   const lastBusyOwnerRef = useRef<string | null>(null);
   const lastBusyStartedRef = useRef<number>(0);
-  // 自分の「早出しロック」は操作を止めない。ブロックは他端末ロックのみ。
+
+  // 自分の早出しロックはUIを止めない。他端末のbusyのみブロック。
   const actionsBlocked = () => lockActive;
 
   const markLockedUntil = (until: number) => {
@@ -208,15 +223,18 @@ export default function App() {
     const delay = Math.max(0, until - Date.now());
     lockTimerRef.current = setTimeout(() => {
       setLockActive(false);
-      // busy解除直後の自動再実行は今回は採用せず（確定後反映方針）
+      // 解除後の自動再実行はしない（確定後反映のため）
     }, delay + 50);
   };
 
-  // === Sync overlay / modal ===
+  /* =========================
+     小ポップ / 失敗モーダル
+     ========================= */
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string>("");
   const syncTimerRef = useRef<any>(null);
   const [showRetryModal, setShowRetryModal] = useState(false);
+
   const startSync = (msg: string, ms = 1000) => {
     setSyncMsg(msg);
     setSyncBusy(true);
@@ -228,7 +246,9 @@ export default function App() {
     syncTimerRef.current = setTimeout(() => setSyncBusy(false), 150);
   };
 
-  // 軽量のオンデマンド再同期（必要時だけ一回pull）
+  /* =========================
+     オンデマンドpull（軽量）
+     ========================= */
   const scheduleOneShotPull = (ms: number) => {
     if (!connected || !supabaseRef.current || !roomId) return;
     setTimeout(async () => {
@@ -250,7 +270,9 @@ export default function App() {
     }, ms);
   };
 
-  // スクロール保存/復元
+  /* =========================
+     スクロール位置の保存/復元
+     ========================= */
   const SCROLL_KEY = "mt_scrollY";
   const reloadWithScrollSave = () => {
     try {
@@ -268,7 +290,9 @@ export default function App() {
     } catch {}
   }, []);
 
-  // ローカル永続化
+  /* =========================
+     ローカル永続化
+     ========================= */
   useEffect(() => {
     localStorage.setItem(LS_INV, JSON.stringify(inventory));
   }, [inventory]);
@@ -289,7 +313,9 @@ export default function App() {
     );
   }, [sbUrl, sbKey, roomId]);
 
-  // helpers
+  /* =========================
+     ヘルパー（在庫/可否/原価）
+     ========================= */
   const canMakeWith = (inv: Inventory, recipeKey: string) => {
     const recipe = RECIPES[recipeKey];
     const blockers: string[] = [];
@@ -321,7 +347,7 @@ export default function App() {
     );
   };
 
-  // 在庫編集用のユーティリティ（未定義だったので追加）
+  // 在庫編集用（ユースケース：補充時）
   const setInventoryValue = (key: keyof Inventory, val: number) => {
     setInventory((prev) => {
       const next = { ...prev };
@@ -341,10 +367,12 @@ export default function App() {
     });
   };
 
-  // ===== 早出しロック + 確定後反映モード =====
+  /* =========================
+     同期（busy早出し + CAS）
+     ========================= */
   const clientId = useRef<string>(ensureClientId());
-  const pushingRef = useRef(false);
-  const earlyAnnouncedRef = useRef(false);
+  const pushingRef = useRef(false);        // 自分が本送信中か（UI反映制御）
+  const earlyAnnouncedRef = useRef(false); // 早出しbusyを連発しないためのフラグ
 
   type RemotePayload = {
     inventory: Inventory;
@@ -365,12 +393,12 @@ export default function App() {
     ...(partial || {}),
   });
 
-  // 自分の「早出し busy 告知」：自端末はブロックしない
+  // 自分の「早出し busy 告知」：見た目のロック＆他端末ブロック。自端末は止めない
   const earlyAnnounce = async () => {
     if (!connected || !supabaseRef.current || !roomId || earlyAnnouncedRef.current)
       return;
     earlyAnnouncedRef.current = true;
-    startSync("同期中…", 1000); // 小ポップ
+    startSync("同期中…", 1000); // 小ポップ（1秒）
     const sb = supabaseRef.current;
     const announce = buildPayload({
       sync: { busy: true, owner: clientId.current, started_at: Date.now() },
@@ -380,7 +408,7 @@ export default function App() {
       .upsert({ id: roomId, payload: announce }, { onConflict: "id" });
   };
 
-  // 自分が立てた busy がDBに反映されたことを確認（確定後にUI反映するため）
+  // 自分のbusyがDB側に反映されたか軽く確認（確定後反映の見え方用）
   const awaitBusyEcho = async (timeoutMs = 800, intervalMs = 80) => {
     if (!connected || !supabaseRef.current || !roomId) return true;
     const sb = supabaseRef.current;
@@ -395,10 +423,10 @@ export default function App() {
       if (remote?.sync?.busy && remote.sync.owner === clientId.current) return true;
       await new Promise((r) => setTimeout(r, intervalMs));
     }
-    return false; // Realtimeで追いつく前提でタイムアウト許容
+    return false;
   };
 
-  // プリフライト：他端末 busy を検出したら弾く & モーダル & TTL後に一回pull
+  // 押下直前のプリフライト：他端末busyなら弾く（モーダル＋TTL後の軽pull）
   const preflightOrBlock = async (): Promise<boolean> => {
     if (!connected || !supabaseRef.current || !roomId) return true;
     if (lockActive) return false;
@@ -421,7 +449,9 @@ export default function App() {
     return true;
   };
 
-  // ---- actions（接続中は busy 確定後にUI反映）----
+  /* =========================
+     アクション（接続中は busy確定→UI反映）
+     ========================= */
   const makeOne = async (recipeKey: string) => {
     if (!(await preflightOrBlock())) return;
     if (connected) {
@@ -435,10 +465,7 @@ export default function App() {
     setInventory((prev: Inventory) => {
       const next: Inventory = { ...prev } as Inventory;
       for (const k in recipe)
-        (next as any)[k] = Math.max(
-          0,
-          ((next as any)[k] as number) - recipe[k]
-        );
+        (next as any)[k] = Math.max(0, ((next as any)[k] as number) - recipe[k]);
       return next;
     });
     setCounts((prev: Counts) => ({
@@ -464,10 +491,7 @@ export default function App() {
     setInventory((prev: Inventory) => {
       const next: Inventory = { ...prev } as Inventory;
       for (const k in recipe)
-        (next as any)[k] = Math.max(
-          0,
-          ((next as any)[k] as number) + recipe[k]
-        );
+        (next as any)[k] = Math.max(0, ((next as any)[k] as number) + recipe[k]);
       return next;
     });
   };
@@ -487,7 +511,9 @@ export default function App() {
     setCounts(o);
   };
 
-  // ---- derived ----
+  /* =========================
+     派生表示・集計
+     ========================= */
   const inventoryList = useMemo<{ key: string; label: string; value: number }[]>(
     () =>
       Object.entries(inventory).map(([k, v]) => ({
@@ -549,7 +575,10 @@ export default function App() {
     return { cups, revenue, cogs: Math.round(cogs), gp: Math.round(gp), margin };
   }, [counts, perCupCost]);
 
-  // ====== Supabase接続 & Realtime ======
+  /* =========================
+     Supabase接続・購読
+     ========================= */
+
   const clearAutoConn = () => {
     try {
       localStorage.removeItem(LS_AUTOCONN);
@@ -563,13 +592,48 @@ export default function App() {
     } catch {}
   };
 
+  // ★ 追加: 最新スナップショットを強制取得する共通関数
+  //   - force=true: ローカルより古くてもサーバ値で上書き（接続直後/明示リロード用）
+  const pullLatest = async (force = false) => {
+    if (!supabaseRef.current || !roomId) return false;
+    try {
+      const { data } = await supabaseRef.current
+        .from("rooms")
+        .select("payload")
+        .eq("id", roomId)
+        .maybeSingle();
+      const r = data?.payload as RemotePayload | undefined;
+      const remoteVer = Number(r?.version || 0);
+      const localVer = Number(versionRef.current || 0);
+      if (r && (force || remoteVer > localVer)) {
+        remoteApplyingRef.current = true;
+        setInventory(r.inventory);
+        setBaseline(r.baseline);
+        setCounts(r.counts);
+        setVersion(remoteVer);
+        return true;
+      }
+    } catch (e) {
+      console.error("pullLatest error", e);
+    }
+    return false;
+  };
+
+  // ★ 追加: 再読み込みボタンの振る舞いを拡張（最新取得→画面リロード）
+  const handleReload = async () => {
+    startSync("最新を取得中…", 800);
+    if (connected) {
+      await pullLatest(true); // サーバを真に最新とみなして上書き
+    }
+    reloadWithScrollSave();
+  };
+
+  // 接続処理
   const connectSupabase = async (): Promise<boolean> => {
     try {
       const cc = await loadSupabase();
       if (!cc) {
-        alert(
-          `supabase-js が見つかりません。\nnpm i @supabase/supabase-js を実行してください。`
-        );
+        alert(`supabase-js が見つかりません。\nnpm i @supabase/supabase-js を実行してください。`);
         clearAutoConn();
         return false;
       }
@@ -584,6 +648,7 @@ export default function App() {
       setConnected(true);
       startSync("接続中…", 800);
 
+      // 初回スナップショット作成 or 取得
       const { data: got } = await sb
         .from("rooms")
         .select("id,payload")
@@ -599,23 +664,23 @@ export default function App() {
           setVersion(remoteVer);
         }
       } else {
-        await sb
-          .from("rooms")
-          .upsert({ id: roomId, payload: buildPayload() }, { onConflict: "id" });
+        await sb.from("rooms").upsert({ id: roomId, payload: buildPayload() }, { onConflict: "id" });
       }
 
+      // Postgres Changes 購読
       if (subscriptionRef.current) sb.removeChannel(subscriptionRef.current);
       const handler = (ev: any) => {
         try {
           const remote = ev?.new?.payload as RemotePayload;
           if (!remote) return;
+
+          // 他端末busyの受信 → TTLまでボタンブロック
           const busy = !!remote?.sync?.busy;
           const owner = remote?.sync?.owner;
           const started = Number(remote?.sync?.started_at || 0);
           if (busy && owner && owner !== clientId.current) {
             const isNewBusy =
-              owner !== lastBusyOwnerRef.current ||
-              started > lastBusyStartedRef.current;
+              owner !== lastBusyOwnerRef.current || started > lastBusyStartedRef.current;
             if (isNewBusy) {
               lastBusyOwnerRef.current = owner;
               lastBusyStartedRef.current = started;
@@ -626,8 +691,9 @@ export default function App() {
             }
           }
 
+          // 新しい版のみを取り込む
           const remoteVer = Number(remote?.version || 0);
-          if (pushingRef.current) return;
+          if (pushingRef.current) return; // 自分の本送信中は無視
           if (remoteVer <= Number(versionRef.current || 0)) return;
 
           if (applyTimerRef.current) clearTimeout(applyTimerRef.current);
@@ -644,26 +710,19 @@ export default function App() {
         .channel(`rooms:${roomId}`)
         .on(
           "postgres_changes",
-          {
-            event: "UPDATE",
-            schema: "public",
-            table: "rooms",
-            filter: `id=eq.${roomId}`,
-          },
+          { event: "UPDATE", schema: "public", table: "rooms", filter: `id=eq.${roomId}` },
           handler
         )
         .on(
           "postgres_changes",
-          {
-            event: "INSERT",
-            schema: "public",
-            table: "rooms",
-            filter: `id=eq.${roomId}`,
-          },
+          { event: "INSERT", schema: "public", table: "rooms", filter: `id=eq.${roomId}` },
           handler
         )
         .subscribe();
       subscriptionRef.current = channel;
+
+      // ★ 接続直後に「必ず」サーバ最新を強制取得
+      await pullLatest(true);
 
       setAutoConnOn();
       finishSync();
@@ -675,24 +734,24 @@ export default function App() {
     }
   };
 
-  // 変更時 push（CAS+busy解除）
+  /* =========================
+     変更時 push（CAS + busy解除）
+     ========================= */
   useEffect(() => {
     const push = async () => {
       if (!connected || !supabaseRef.current || !roomId) return;
+      // 直前にRealtimeを当て込んだ反射は無視（ループ抑止）
       if (remoteApplyingRef.current) {
         remoteApplyingRef.current = false;
         return;
       }
+      // ローカル差分がないなら送らない
       if (!localDirtyRef.current) return;
 
       const sb = supabaseRef.current;
 
-      // 他端末 busy 中は待つ
-      const { data } = await sb
-        .from("rooms")
-        .select("payload")
-        .eq("id", roomId)
-        .maybeSingle();
+      // 他端末のbusyを検出したら少し待ってリトライ
+      const { data } = await sb.from("rooms").select("payload").eq("id", roomId).maybeSingle();
       const remote = data?.payload as RemotePayload | undefined;
       if (remote?.sync?.busy && remote.sync.owner !== clientId.current) {
         const started = Number(remote.sync.started_at || 0);
@@ -703,28 +762,26 @@ export default function App() {
         return;
       }
 
-      const expected = Number(version) || 0;
+      const expected = Number(version) || 0; // CASの期待版
       const nextVersion = expected + 1;
 
-      // 送信開始の小ポップ（1秒）
-      pushingRef.current = true; // ← CAS直前の本送信でのみ立てる
+      // 本送信前だけ「同期中…」小ポップ
+      pushingRef.current = true;
       startSync("同期中…", 1000);
 
-      // busy 告知（見た目と他端末ブロック用）
+      // busy告知（見た目/他端末ブロック用）
       const announce = buildPayload({
         sync: { busy: true, owner: clientId.current, started_at: Date.now() },
       });
-      await sb
-        .from("rooms")
-        .upsert({ id: roomId, payload: announce }, { onConflict: "id" });
+      await sb.from("rooms").upsert({ id: roomId, payload: announce }, { onConflict: "id" });
 
-      // 最終スナップショット（versionを+1）
+      // 最終スナップショット（busy解除 + version++）
       const finalPayload = buildPayload({
         version: nextVersion,
         sync: { busy: false, owner: clientId.current, started_at: Date.now() },
       });
 
-      // CAS（条件付き更新）
+      // CAS（payload->>version が expected のときだけ更新）
       const { data: upd, error: casErr } = await sb
         .from("rooms")
         .update({ payload: finalPayload })
@@ -734,6 +791,7 @@ export default function App() {
 
       if (casErr) {
         console.error("CAS update error", casErr);
+        // フォールバック：最新版に合わせてUIを同期 + モーダル
         const { data: latest } = await sb
           .from("rooms")
           .select("payload")
@@ -759,6 +817,7 @@ export default function App() {
       }
 
       if (!upd || upd.length === 0) {
+        // 誰かが先にversionを進めた（競合）→ 最新を取り込んでから案内
         startSync("更新競合 → 最新を反映", 900);
         const { data: latest } = await sb
           .from("rooms")
@@ -784,7 +843,7 @@ export default function App() {
         return;
       }
 
-      // CAS成功
+      // CAS成功：ローカル版を進めて完了
       setVersion(nextVersion);
       localDirtyRef.current = false;
       setTimeout(() => {
@@ -797,6 +856,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [inventory, baseline, counts]);
 
+  /* =========================
+     自動再接続
+     ========================= */
   useEffect(() => {
     const auto = (() => {
       try {
@@ -820,89 +882,46 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // DEV quick tests
+  /* =========================
+     デバッグ用: クイック検証
+     ========================= */
   useEffect(() => {
-    const results: { name: string; pass: boolean; got: any; expected: any }[] =
-      [];
+    const results: { name: string; pass: boolean; got: any; expected: any }[] = [];
     const eq = (name: string, got: any, expected: any) =>
       results.push({ name, pass: Object.is(got, expected), got, expected });
-    eq(
-      "白桃さっぱり max",
-      servingsLeftWith(INITIAL_INVENTORY as any, "白桃スカッシュ / さっぱり"),
-      40
-    );
-    eq(
-      "モヒート甘め max",
-      servingsLeftWith(INITIAL_INVENTORY as any, "パインモヒート / 甘め"),
-      35
-    );
-    eq(
-      "トロピカルすっきり max",
-      servingsLeftWith(INITIAL_INVENTORY as any, "トロピカルスカッシュ / すっきり"),
-      30
-    );
-    const invNoPeach = {
-      ...INITIAL_INVENTORY,
-      peach_pieces: 0,
-    } as typeof INITIAL_INVENTORY;
-    eq(
-      "白桃トッピング不足検出",
-      canMakeWith(invNoPeach as Inventory, "白桃スカッシュ / さっぱり").ok,
-      false
-    );
-    const invFewSoda = {
-      ...INITIAL_INVENTORY,
-      soda_tropical: 110,
-    } as typeof INITIAL_INVENTORY;
-    eq(
-      "トロピカル 1杯",
-      servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"),
-      1
-    );
-    const invMoreSoda = {
-      ...invFewSoda,
-      soda_tropical: 220,
-    } as typeof INITIAL_INVENTORY;
-    eq(
-      "トロピカル 2杯",
-      servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"),
-      2
-    );
+    eq("白桃さっぱり max", servingsLeftWith(INITIAL_INVENTORY as any, "白桃スカッシュ / さっぱり"), 40);
+    eq("モヒート甘め max", servingsLeftWith(INITIAL_INVENTORY as any, "パインモヒート / 甘め"), 35);
+    eq("トロピカルすっきり max", servingsLeftWith(INITIAL_INVENTORY as any, "トロピカルスカッシュ / すっきり"), 30);
+    const invNoPeach = { ...INITIAL_INVENTORY, peach_pieces: 0 } as typeof INITIAL_INVENTORY;
+    eq("白桃トッピング不足検出", canMakeWith(invNoPeach as Inventory, "白桃スカッシュ / さっぱり").ok, false);
+    const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY;
+    eq("トロピカル 1杯", servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"), 1);
+    const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY;
+    eq("トロピカル 2杯", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
     const afterOne = {
       ...INITIAL_INVENTORY,
       white_peach_syrup: INITIAL_INVENTORY.white_peach_syrup - 20,
       soda_white: INITIAL_INVENTORY.soda_white - 120,
       peach_pieces: INITIAL_INVENTORY.peach_pieces - 1,
     } as typeof INITIAL_INVENTORY;
-    eq(
-      "白桃さっぱり 1杯後 max",
-      servingsLeftWith(afterOne as any, "白桃スカッシュ / さっぱり"),
-      39
-    );
+    eq("白桃さっぱり 1杯後 max", servingsLeftWith(afterOne as any, "白桃スカッシュ / さっぱり"), 39);
     eq(
       "白桃さっぱり syrup不足",
-      canMakeWith(
-        { ...INITIAL_INVENTORY, white_peach_syrup: 19 } as any,
-        "白桃スカッシュ / さっぱり"
-      ).ok,
+      canMakeWith({ ...INITIAL_INVENTORY, white_peach_syrup: 19 } as any, "白桃スカッシュ / さっぱり").ok,
       false
     );
     eq(
       "白桃さっぱり soda不足",
-      canMakeWith(
-        { ...INITIAL_INVENTORY, soda_white: 119 } as any,
-        "白桃スカッシュ / さっぱり"
-      ).ok,
+      canMakeWith({ ...INITIAL_INVENTORY, soda_white: 119 } as any, "白桃スカッシュ / さっぱり").ok,
       false
     );
-    eq(
-      "1杯原価(白桃さっぱり)=109.4",
-      (perCupCost as any)["白桃スカッシュ / さっぱり"],
-      109.4
-    );
+    eq("1杯原価(白桃さっぱり)=109.4", (perCupCost as any)["白桃スカッシュ / さっぱり"], 109.4);
     console.table(results);
   }, []);
 
+  /* =========================
+     UI
+     ========================= */
   return (
     <>
       <div className="min-h-screen bg-neutral-50 text-neutral-900 p-6">
@@ -922,20 +941,21 @@ export default function App() {
               <button
                 onClick={() => setEditMode((v) => !v)}
                 className={`px-4 py-2 rounded-2xl shadow ${
-                  editMode
-                    ? "bg-amber-600 hover:bg-amber-700 text-white"
-                    : "bg-white hover:bg-neutral-100 text-neutral-900"
+                  editMode ? "bg-amber-600 hover:bg-amber-700 text-white" : "bg-white hover:bg-neutral-100 text-neutral-900"
                 }`}
               >
                 {editMode ? "在庫編集: ON" : "在庫編集: OFF"}
               </button>
+
+              {/* ★ 変更: 再読み込み → 事前に最新pullしてからリロード */}
               <button
-                onClick={reloadWithScrollSave}
+                onClick={handleReload}
                 className="px-3 py-2 rounded-2xl bg-white hover:bg-neutral-100 text-neutral-900 border border-neutral-200 shadow"
-                title="ページを再読み込み"
+                title="最新取得→ページ再読み込み"
               >
                 再読み込み
               </button>
+
               <button
                 onClick={resetAll}
                 className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow"
@@ -967,10 +987,10 @@ export default function App() {
                 value={roomId}
                 onChange={(e) => setRoomId(e.target.value)}
               />
+
+              {/* ★ 接続ボタンクリック → 接続完了後にpullLatest(true) が走る */}
               <button
-                className={`px-4 py-2 rounded ${
-                  connected ? "bg-emerald-600 text-white" : "bg-neutral-900 text-white"
-                }`}
+                className={`px-4 py-2 rounded ${connected ? "bg-emerald-600 text-white" : "bg-neutral-900 text-white"}`}
                 onClick={connectSupabase}
               >
                 {connected ? "接続中" : "接続"}
@@ -1016,25 +1036,22 @@ export default function App() {
                     <h2 className="font-semibold text-lg">{key}</h2>
                     <p className="text-xs text-neutral-500">
                       作成数: <span className="font-mono">{counts[key] || 0}</span> / 可能:{" "}
-                      <span className="font-mono">{left}</span> 杯 / 1杯原価:{" "}
-                      <span className="font-mono">¥{perCupCost[key]}</span>
+                      <span className="font-mono">{left}</span> 杯 / 1杯原価: <span className="font-mono">¥{perCupCost[key]}</span>
                     </p>
                   </div>
 
                   <div className="text-xs bg-neutral-50 rounded-xl p-3">
                     <p className="text-neutral-500 mb-1">1杯あたりの使用量</p>
                     <ul className="grid grid-cols-2 gap-1">
-                      {(Object.entries(RECIPES[key]) as [string, number][])?.map(
-                        ([ik, amount]) => (
-                          <li key={ik} className="flex items-center justify-between">
-                            <span>{NICE_LABEL[ik as keyof typeof NICE_LABEL] || ik}</span>
-                            <span className="font-mono">
-                              {amount}
-                              {ik === "peach_pieces" ? "個" : "ml"}
-                            </span>
-                          </li>
-                        )
-                      )}
+                      {(Object.entries(RECIPES[key]) as [string, number][])?.map(([ik, amount]) => (
+                        <li key={ik} className="flex items-center justify-between">
+                          <span>{NICE_LABEL[ik as keyof typeof NICE_LABEL] || ik}</span>
+                          <span className="font-mono">
+                            {amount}
+                            {ik === "peach_pieces" ? "個" : "ml"}
+                          </span>
+                        </li>
+                      ))}
                     </ul>
                   </div>
 
@@ -1043,9 +1060,7 @@ export default function App() {
                       onClick={() => makeOne(key)}
                       disabled={disabledMake}
                       className={`px-4 py-2 rounded-xl font-medium shadow transition ${
-                        disabledMake
-                          ? "bg-neutral-200 text-neutral-500 cursor-not-allowed"
-                          : "bg-emerald-600 hover:bg-emerald-700 text-white"
+                        disabledMake ? "bg-neutral-200 text-neutral-500 cursor-not-allowed" : "bg-emerald-600 hover:bg-emerald-700 text-white"
                       }`}
                     >
                       1杯作る
@@ -1054,9 +1069,7 @@ export default function App() {
                       onClick={() => undoOne(key)}
                       disabled={disabledUndo}
                       className={`px-4 py-2 rounded-xl font-medium shadow transition ${
-                        disabledUndo
-                          ? "bg-neutral-200 text-neutral-500 cursor-not-allowed"
-                          : "bg-red-600 hover:bg-red-700 text-white"
+                        disabledUndo ? "bg-neutral-200 text-neutral-500 cursor-not-allowed" : "bg-red-600 hover:bg-red-700 text-white"
                       }`}
                       title="直前の誤操作などを取り消して1杯分を在庫に戻します"
                     >
@@ -1064,11 +1077,7 @@ export default function App() {
                     </button>
                   </div>
 
-                  {!ok && (
-                    <div className="text-xs text-red-600">
-                      在庫不足：{blockers.join("・")}
-                    </div>
-                  )}
+                  {!ok && <div className="text-xs text-red-600">在庫不足：{blockers.join("・")}</div>}
                 </div>
               );
             })}
@@ -1090,19 +1099,12 @@ export default function App() {
                     ? "border border-amber-300 bg-amber-50"
                     : "border border-neutral-200 bg-white";
                 return (
-                  <div
-                    key={key}
-                    className={`${wrapCls} rounded-xl p-3 shadow text-sm flex flex-col gap-2`}
-                  >
+                  <div key={key} className={`${wrapCls} rounded-xl p-3 shadow text-sm flex flex-col gap-2`}>
                     <div className="flex items-center justify-between">
                       <span>{label}</span>
                       <span
                         className={`font-mono ${
-                          level === "danger"
-                            ? "text-red-700"
-                            : level === "warn"
-                            ? "text-amber-700"
-                            : "text-neutral-900"
+                          level === "danger" ? "text-red-700" : level === "warn" ? "text-amber-700" : "text-neutral-900"
                         }`}
                       >
                         {value}
@@ -1112,13 +1114,7 @@ export default function App() {
                     {base > 0 && (
                       <div className="h-2 w-full rounded bg-neutral-100 overflow-hidden">
                         <div
-                          className={`${
-                            level === "danger"
-                              ? "bg-red-500"
-                              : level === "warn"
-                              ? "bg-amber-500"
-                              : "bg-emerald-500"
-                          } h-full`}
+                          className={`${level === "danger" ? "bg-red-500" : level === "warn" ? "bg-amber-500" : "bg-emerald-500"} h-full`}
                           style={{ width: `${pct * 100}%` }}
                           aria-hidden
                         />
@@ -1131,50 +1127,30 @@ export default function App() {
                           inputMode="numeric"
                           className="w-28 px-2 py-1 rounded border border-neutral-300 font-mono"
                           value={value as number}
-                          onChange={(e) =>
-                            setInventoryValue(key as keyof Inventory, Number(e.target.value))
-                          }
+                          onChange={(e) => setInventoryValue(key as keyof Inventory, Number(e.target.value))}
                         />
                         <div className="flex gap-1">
                           {isPieces ? (
                             <>
-                              <button
-                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
-                                onClick={() => bumpInventory(key as keyof Inventory, 1)}
-                              >
+                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 1)}>
                                 +1
                               </button>
-                              <button
-                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
-                                onClick={() => bumpInventory(key as keyof Inventory, 5)}
-                              >
+                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 5)}>
                                 +5
                               </button>
-                              <button
-                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
-                                onClick={() => bumpInventory(key as keyof Inventory, 10)}
-                              >
+                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 10)}>
                                 +10
                               </button>
                             </>
                           ) : (
                             <>
-                              <button
-                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
-                                onClick={() => bumpInventory(key as keyof Inventory, 50)}
-                              >
+                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 50)}>
                                 +50
                               </button>
-                              <button
-                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
-                                onClick={() => bumpInventory(key as keyof Inventory, 100)}
-                              >
+                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 100)}>
                                 +100
                               </button>
-                              <button
-                                className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200"
-                                onClick={() => bumpInventory(key as keyof Inventory, 500)}
-                              >
+                              <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 500)}>
                                 +500
                               </button>
                             </>
@@ -1191,42 +1167,24 @@ export default function App() {
             </p>
           </section>
 
-          {/* 小ポップ */}
+          {/* 小ポップ（画面上部に1秒） */}
           {syncBusy && (
             <div className="fixed inset-0 pointer-events-none flex items-start justify-center">
               <div className="mt-10 px-4 py-2 rounded-xl shadow bg-neutral-900/90 text-white text-sm flex items-center gap-2">
-                <svg
-                  className="w-4 h-4 animate-spin"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  xmlns="http://www.w3.org/2000/svg"
-                >
-                  <circle
-                    className="opacity-25"
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    strokeWidth="4"
-                  />
-                  <path
-                    className="opacity-75"
-                    fill="currentColor"
-                    d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
-                  />
+                <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
                 </svg>
                 <span>{syncMsg || "同期中…"}</span>
               </div>
             </div>
           )}
 
-          {/* 送信失敗モーダル */}
+          {/* 送信失敗モーダル（中央） */}
           {showRetryModal && (
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
               <div className="w-[92%] max-w-md rounded-2xl bg-white shadow-xl p-6 text-center">
-                <h3 className="text-base font-semibold text-neutral-900 mb-2">
-                  送信できませんでした
-                </h3>
+                <h3 className="text-base font-semibold text-neutral-900 mb-2">送信できませんでした</h3>
                 <p className="text-sm text-neutral-600">もう一度お試しください。</p>
                 <div className="mt-5">
                   <button
