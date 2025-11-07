@@ -175,7 +175,8 @@ export default function App() {
     const delay = Math.max(0, until - Date.now());
     lockTimerRef.current = setTimeout(() => setLockActive(false), delay + 50);
   };
-  const actionsBlocked = () => pushingRef.current || lockActive; // Realtime反映のデバウンス
+  // 自分の「早出しロック」は操作を止めない。ブロックは他端末ロックのみ。
+  const actionsBlocked = () => lockActive;
 
   // === Sync overlay state ===
   const [syncBusy, setSyncBusy] = useState(false);
@@ -252,7 +253,7 @@ export default function App() {
   const earlyAnnounce = async () => {
     if (!connected || !supabaseRef.current || !roomId || earlyAnnouncedRef.current) return;
     earlyAnnouncedRef.current = true;
-    pushingRef.current = true;          // 自端末も一瞬ロック
+    // pushingRef.current は触らない（ここで立てるとローカル操作が止まる）
     startSync('同期中…', 1000);        // 既存の小ポップを流用
     const sb = supabaseRef.current;
     const announce = buildPayload({ sync: { busy: true, owner: clientId.current, started_at: Date.now() } });
@@ -525,7 +526,7 @@ export default function App() {
       const expected = Number(version) || 0;
       const nextVersion = expected + 1;
       // 送信開始の小ポップ（1秒）
-      pushingRef.current = true;
+      pushingRef.current = true; // ← ここはCAS直前の「本送信」でのみ立てる（従来どおり）
       startSync('同期中…', 1000);
 
       // (任意) busy 告知は維持。見た目用に1秒ロックさせたい場合は残す

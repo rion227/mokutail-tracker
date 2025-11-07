@@ -1,3 +1,7 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 0000000..1111111 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
 @@
 -  const actionsBlocked = () => pushingRef.current || lockActive; // Realtime反映のデバウンス
 +  // 自分の「早出しロック」は操作を止めない。ブロックは他端末ロックのみ。
