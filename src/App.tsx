@@ -181,6 +181,8 @@ export default function App() {
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string>("");
   const syncTimerRef = useRef<any>(null);
+  // 競合時の明示モーダル
+  const [showRetryModal, setShowRetryModal] = useState(false);
   // 2nd引数で表示時間(ms)を可変に。既定は1秒。
   const startSync = (msg: string, ms = 1000) => {
     setSyncMsg(msg);
@@ -518,6 +520,8 @@ export default function App() {
           setInventory(r.inventory); setBaseline(r.baseline); setCounts(r.counts); setVersion(Number(r.version || 0));
         }
         localDirtyRef.current = false;
+        // ユーザーに明示（小ポップに加えて中央モーダル）
+        setShowRetryModal(true);
         setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
         return;
       }
@@ -532,6 +536,8 @@ export default function App() {
           setInventory(r.inventory); setBaseline(r.baseline); setCounts(r.counts); setVersion(Number(r.version || 0));
         }
         localDirtyRef.current = false; // この操作はキャンセル扱い（次の操作で正しいベースから送られる）
+        // ユーザーに明示（小ポップに加えて中央モーダル）
+        setShowRetryModal(true);
         setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
         return;
       }
@@ -754,6 +760,24 @@ export default function App() {
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/>
               </svg>
               <span>{syncMsg || '同期中…'}</span>
+            </div>
+          </div>
+        )}
+
+        {/* 競合で送信失敗した後の明示モーダル */}
+        {showRetryModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+            <div className="w-[92%] max-w-md rounded-2xl bg-white shadow-xl p-6 text-center">
+              <h3 className="text-base font-semibold text-neutral-900 mb-2">送信できませんでした</h3>
+              <p className="text-sm text-neutral-600">もう一度お試しください。</p>
+              <div className="mt-5">
+                <button
+                  onClick={() => setShowRetryModal(false)}
+                  className="inline-flex items-center justify-center rounded-xl bg-neutral-900 text-white px-4 py-2 hover:bg-neutral-800 shadow"
+                >
+                  OK
+                </button>
+              </div>
             </div>
           </div>
         )}
