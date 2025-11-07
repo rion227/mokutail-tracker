@@ -162,7 +162,7 @@ export default function App() {
   const localDirtyRef = useRef(false);     // ローカル操作が入った時だけ push
   
   // ---- lock control (reduce flicker) ----
-  const LOCK_TTL_MS = 3000; // 他端末のロック有効時間（ms）
+  const LOCK_TTL_MS = 1000; // 他端末のロック有効時間（ms）← 3秒→1秒に短縮
   const lockUntilRef = useRef<number>(0);
   const [lockActive, setLockActive] = useState(false);
   const lockTimerRef = useRef<any>(null);
@@ -181,11 +181,12 @@ export default function App() {
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncMsg, setSyncMsg] = useState<string>("");
   const syncTimerRef = useRef<any>(null);
-  const startSync = (msg: string) => {
+  // 2nd引数で表示時間(ms)を可変に。既定は1秒。
+  const startSync = (msg: string, ms = 1000) => {
     setSyncMsg(msg);
     setSyncBusy(true);
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
-    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 2500);
+    syncTimerRef.current = setTimeout(() => setSyncBusy(false), ms);
   };
   const finishSync = () => {
     if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
@@ -385,7 +386,8 @@ export default function App() {
       const sb = cc(sbUrl, sbKey);
       supabaseRef.current = sb;
       setConnected(true);
-      startSync('接続中…');
+      // 接続時のポップは短めに
+      startSync('接続中…', 800);
 
       const { data: got, error: selErr } = await sb.from('rooms').select('id,payload').eq('id', roomId).maybeSingle();
       if (selErr) {
@@ -420,6 +422,9 @@ export default function App() {
               lastBusyStartedRef.current = started;
               const until = started + LOCK_TTL_MS;
               if (until > Date.now()) markLockedUntil(until);
+              // ロック中は小ポップをロック残存時間だけ表示
+              const remain = Math.max(0, until - Date.now());
+              startSync('同期中…', Math.max(remain, 600));
             }
           }
 
@@ -483,7 +488,8 @@ export default function App() {
       // 自分がロック告知
       const announce = buildPayload({ sync: { busy: true, owner: clientId.current, started_at: Date.now() } });
       pushingRef.current = true;
-      startSync('同期中…');
+      // 自端末側の送信開始時も1秒だけ小ポップ
+      startSync('同期中…', 1000);
       await sb.from('rooms').upsert({ id: roomId, payload: announce }, { onConflict: 'id' });
 
       // 最終状態をコミット（busy=false）
