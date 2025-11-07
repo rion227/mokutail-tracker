@@ -2,28 +2,33 @@ import { useEffect, useMemo, useRef, useState } from "react";
 // 共有同期対応版（Supabase optional） + グローバル同期ロック（ソフトロック）
 // - ローカル保存 + 任意で Supabase を使った端末間同期（同じ Room ID で共有）
 // - だれかが変更送信を開始したら、全端末で「同期中」表示になって操作を一時停止
-// - 最初に送信を“宣言”した端末が勝ち（soft lock）。完了でロック解除 → 全端端末再開
+// - 最初に送信を“宣言”した端末が勝ち（soft lock）。完了でロック解除 → 全端末再開
 // - 追加: 自動再接続（LS_AUTOCONN）/ 他端末更新を**ページ再読込なし**で反映 / スクロール位置の保存復元（手動再読込時）
 
 // ==== 売価設定 ====
 const PRICE_PER_CUP = 300; // 円
 
 // ==== 原価単価（円/ml 相当）====
+// 参照: 「購入金額と内訳8.xlsx」 送料を数量で按分して単価化
 const UNIT_COSTS: Record<string, number> = {
-  white_peach_syrup: 1678 / 1000,
-  mango_syrup: 867 / 600,
-  pine_mojito: 1398 / 1000,
-  pine_tropical: 1398 / 1000,
-  lemon_mojito: 1218 / 780,
-  lemon_tropical: 1218 / 780,
-  mojito: 1520 / 750,
-  cassis: 2299 / 750,
-  orange_juice: 1200 / 3000,
-  soda_white: 1448 / 12000,
+  // シロップ類
+  white_peach_syrup: 1678 / 1000,          // 白桃シロップ1000ml
+  mango_syrup: 867 / 600,                  // マンゴーシロップ600ml
+  pine_mojito: 1398 / 1000,                // パインシロップ1000ml
+  pine_tropical: 1398 / 1000,              // 同上（トロピカルでも共通利用）
+  lemon_mojito: (579 + 610) / 780,         // レモンシロップ780ml + 送料610
+  lemon_tropical: (579 + 610) / 780,       // 同上
+  // リキッド類
+  mojito: 2709 / 750,                      // モヒートミント250ml×3 = 750ml（送料等込み）
+  cassis: 2091 / 750,                      // カシス250ml×3 = 750ml（送料等込み）
+  // 飲料
+  orange_juice: 1500 / 3000,               // オレンジ1000ml×3
+  soda_white: 1448 / 12000,                // 炭酸 500ml×24 = 12L
   soda_mojito: 1448 / 12000,
   soda_tropical: 1448 / 12000,
 };
-const PEACH_GARNISH_COST = 61.4; // 円/個
+// トッピング（白桃缶は「40杯想定」なので総額を40で按分）: (2068 + 386[送料]) / 40
+const PEACH_GARNISH_COST = (2068 + 386) / 40; // = 61.35 円/個（表示は小数1桁丸め）
 
 // ==== 初期在庫 ====
 const INITIAL_INVENTORY = {
@@ -33,10 +38,10 @@ const INITIAL_INVENTORY = {
   pine_tropical: 650,
   lemon_mojito: 390,
   lemon_tropical: 390,
-  mojito: 750,
-  cassis: 750,
+  mojito: 750,          // シート準拠
+  cassis: 750,          // シート準拠
   orange_juice: 3000,
-  soda_white: 4800,
+  soda_white: 4800,     // 炭酸(白桃) 4800ml に修正
   soda_mojito: 3850,
   soda_tropical: 3350,
   peach_pieces: 40,
@@ -56,24 +61,9 @@ const RECIPES: Record<string, Record<string, number>> = {
   "トロピカルスカッシュ / 甘め": { mango_syrup: 15, pine_tropical: 25, lemon_tropical: 5, soda_tropical: 90 },
   "カシスオレンジ / すっきり(110ml)": { cassis: 20, orange_juice: 110 },
   "カシスオレンジ / 甘め(100ml)": { cassis: 25, orange_juice: 100 },
-  "カシスオレンジ / 甘め(90ml)": { cassis: 25, orange_juice: 90 },
 };
 
-// ==== シートの「1杯あたり原価(円)」を優先的に使うマップ ====
-// （未記載のものは原材料計算でフォールバック）
-const PER_RECIPE_COSTS: Record<string, number> = {
-  "白桃スカッシュ / さっぱり": 109.4,
-  "白桃スカッシュ / 甘め": 115.4,
-  "パインモヒート / すっきり": 104.7,
-  "パインモヒート / 甘め": 104.1,
-  "トロピカルスカッシュ / すっきり": 63.3,
-  "トロピカルスカッシュ / 甘め": 75.1,
-  "カシスオレンジ / すっきり(110ml)": 110.8,
-  "カシスオレンジ / 甘め(100ml)": 119.7,
-  // (90ml)はシート未記載 → 100ml 版から OJ 10ml(=4円)を差し引き
-  "カシスオレンジ / 甘め(90ml)": 115.7,
-};
-
+// 表示名
 const NICE_LABEL: Record<string, string> = {
   white_peach_syrup: "白桃シロップ",
   mango_syrup: "マンゴー",
@@ -90,6 +80,18 @@ const NICE_LABEL: Record<string, string> = {
   peach_pieces: "白桃トッピング(個)",
 };
 
+// ==== シートの1杯原価(円)を優先的に使うテーブル（原価3.xlsx 準拠）====
+const PER_RECIPE_COSTS: Record<string, number> = {
+  "白桃スカッシュ / さっぱり": 109.4,
+  "白桃スカッシュ / 甘め": 115.4,
+  "パインモヒート / すっきり": 104.7,
+  "パインモヒート / 甘め": 104.1,
+  "トロピカルスカッシュ / すっきり": 63.3,
+  "トロピカルスカッシュ / 甘め": 75.1,
+  "カシスオレンジ / すっきり(110ml)": 110.8,
+  "カシスオレンジ / 甘め(100ml)": 119.7,
+};
+
 // === localStorage keys ===
 const LS_INV = "mt_inv";
 const LS_BASE = "mt_base";
@@ -101,7 +103,7 @@ const LS_AUTOCONN = "mt_autoconn"; // '1' で自動再接続
 
 // ====== Supabase (optional / lazy import) ======
 let createClient: any | null = null;
-async function lazyImportSupabaseCreateClient() {
+const loadSupabase = async () => {
   if (createClient) return createClient;
   try {
     const mod = await import('@supabase/supabase-js');
@@ -117,99 +119,213 @@ function ensureClientId() {
   try {
     const now = Date.now().toString(36);
     let cid = localStorage.getItem(LS_CLIENT);
-    if (!cid) {
-      cid = `${Math.random().toString(36).slice(2, 8)}-${now}`;
-      localStorage.setItem(LS_CLIENT, cid);
-    }
+    if (!cid) { cid = `${now}-${Math.random().toString(36).slice(2,8)}`; localStorage.setItem(LS_CLIENT, cid); }
     return cid;
   } catch {
-    return "local-unknown";
+    return `cid-${Math.random().toString(36).slice(2,8)}`;
   }
-}
-
-// 在庫差分計算
-function subInv(inv: Inventory, recipe: Record<string, number>, times = 1): Inventory {
-  const next = { ...inv };
-  for (const k of Object.keys(recipe)) {
-    (next as any)[k] = Math.max(0, ((next as any)[k] ?? 0) - (recipe as any)[k] * times);
-  }
-  return next;
-}
-
-function addInv(inv: Inventory, recipe: Record<string, number>, times = 1): Inventory {
-  const next = { ...inv };
-  for (const k of Object.keys(recipe)) {
-    (next as any)[k] = ((next as any)[k] ?? 0) + (recipe as any)[k] * times;
-  }
-  return next;
-}
-
-// 何杯作れるか
-function servingsLeftWith(inv: Inventory, name: string): number {
-  const r = RECIPES[name]; if (!r) return 0;
-  let min = Infinity;
-  for (const k of Object.keys(r)) {
-    const need = (r as any)[k];
-    const have = (inv as any)[k] ?? 0;
-    min = Math.min(min, Math.floor(have / need));
-  }
-  return Number.isFinite(min) ? min : 0;
-}
-
-// 作成可否
-function canMakeWith(inv: Inventory, name: string) {
-  const r = RECIPES[name]; if (!r) return { ok: false, reason: "unknown" as const };
-  for (const k of Object.keys(r)) {
-    const need = (r as any)[k];
-    const have = (inv as any)[k] ?? 0;
-    if (have < need) return { ok: false, reason: k as keyof Inventory };
-  }
-  return { ok: true as const };
 }
 
 export default function App() {
+  // ---- state ----
   const [inventory, setInventory] = useState<Inventory>(() => {
-    try { const s = localStorage.getItem(LS_INV); if (s) return JSON.parse(s); } catch {}
-    return { ...INITIAL_INVENTORY };
+    try { const raw = localStorage.getItem(LS_INV); return raw ? JSON.parse(raw) : INITIAL_INVENTORY; } catch { return INITIAL_INVENTORY; }
   });
   const [baseline, setBaseline] = useState<Baseline>(() => {
-    try { const s = localStorage.getItem(LS_BASE); if (s) return JSON.parse(s); } catch {}
-    return { ...INITIAL_INVENTORY };
+    try { const raw = localStorage.getItem(LS_BASE); return raw ? JSON.parse(raw) : INITIAL_INVENTORY; } catch { return INITIAL_INVENTORY; }
   });
   const [counts, setCounts] = useState<Counts>(() => {
-    try { const s = localStorage.getItem(LS_COUNTS); if (s) return JSON.parse(s); } catch {}
-    return {};
+    try { const raw = localStorage.getItem(LS_COUNTS); if (raw) return JSON.parse(raw); } catch {}
+    const o: Counts = {}; (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0)); return o;
+  });
+  const [editMode, setEditMode] = useState(false);
+
+  const [version, setVersion] = useState<number>(() => {
+    try { return Number(localStorage.getItem(LS_VER) || '0') || 0; } catch { return 0; }
   });
 
-  // ==== Supabase接続（任意）関連状態 ====
-  const [sbUrl, setSbUrl] = useState<string>(() => localStorage.getItem("mt_sb_url") || "");
-  const [sbKey, setSbKey] = useState<string>(() => localStorage.getItem("mt_sb_key") || "");
-  const [roomId, setRoomId] = useState<string>(() => localStorage.getItem("mt_room") || "");
-  const [connected, setConnected] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const syncOwner = useRef<string | null>(null);
+  const [sbUrl, setSbUrl] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').url || ''; } catch { return ''; } });
+  const [sbKey, setSbKey] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').key || ''; } catch { return ''; } });
+  const [roomId, setRoomId] = useState(() => { try { return JSON.parse(localStorage.getItem(LS_SYNC) || '{}').room || ''; } catch { return ''; } });
 
-  // ==== 保存 ====
-  useEffect(() => { try { localStorage.setItem(LS_INV, JSON.stringify(inventory)); } catch {} }, [inventory]);
-  useEffect(() => { try { localStorage.setItem(LS_BASE, JSON.stringify(baseline)); } catch {} }, [baseline]);
-  useEffect(() => { try { localStorage.setItem(LS_COUNTS, JSON.stringify(counts)); } catch {} }, [counts]);
-  useEffect(() => { try { localStorage.setItem("mt_sb_url", sbUrl); } catch {} }, [sbUrl]);
-  useEffect(() => { try { localStorage.setItem("mt_sb_key", sbKey); } catch {} }, [sbKey]);
-  useEffect(() => { try { localStorage.setItem("mt_room", roomId); } catch {} }, [roomId]);
+  // 接続ボタンの初期表示は「自動再接続フラグ」に従う
+  const [connected, setConnected] = useState<boolean>(() => {
+    try { return localStorage.getItem(LS_AUTOCONN) === '1'; } catch { return false; }
+  });
 
-  // ==== 1杯あたり原価 ====
+  const supabaseRef = useRef<any>(null);
+  const versionRef = useRef<number>(0);
+  const subscriptionRef = useRef<any>(null);
+  const applyTimerRef = useRef<any>(null);
+  // --- push/apply guards ---
+  const remoteApplyingRef = useRef(false); // リモート適用中は push を抑止
+  const localDirtyRef = useRef(false);     // ローカル操作が入った時だけ push
+  
+  // ---- lock control (reduce flicker) ----
+  const LOCK_TTL_MS = 3000; // 他端末のロック有効時間（ms）
+  const lockUntilRef = useRef<number>(0);
+  const [lockActive, setLockActive] = useState(false);
+  const lockTimerRef = useRef<any>(null);
+  const lastBusyOwnerRef = useRef<string | null>(null);
+  const lastBusyStartedRef = useRef<number>(0);
+  const markLockedUntil = (until: number) => {
+    lockUntilRef.current = until;
+    setLockActive(true);
+    if (lockTimerRef.current) clearTimeout(lockTimerRef.current);
+    const delay = Math.max(0, until - Date.now());
+    lockTimerRef.current = setTimeout(() => setLockActive(false), delay + 50);
+  };
+  const actionsBlocked = () => pushingRef.current || lockActive; // Realtime反映のデバウンス
+
+  // === Sync overlay state ===
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncMsg, setSyncMsg] = useState<string>("");
+  const syncTimerRef = useRef<any>(null);
+  const startSync = (msg: string) => {
+    setSyncMsg(msg);
+    setSyncBusy(true);
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 2500);
+  };
+  const finishSync = () => {
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(() => setSyncBusy(false), 150);
+  };
+
+  // スクロール保存/復元（手動再読込ボタン用。自動同期ではリロードしない設計に変更）
+  const SCROLL_KEY = 'mt_scrollY';
+  const reloadWithScrollSave = () => { try { sessionStorage.setItem(SCROLL_KEY, String(window.scrollY || 0)); } catch {} window.location.reload(); };
+  useEffect(() => {
+    try {
+      const y = Number(sessionStorage.getItem(SCROLL_KEY) || 'NaN');
+      if (Number.isFinite(y)) {
+        sessionStorage.removeItem(SCROLL_KEY);
+        setTimeout(() => window.scrollTo(0, y), 0);
+      }
+    } catch { /* noop */ }
+  }, []);
+
+  // ローカル永続化
+  useEffect(() => { localStorage.setItem(LS_INV, JSON.stringify(inventory)); }, [inventory]);
+  useEffect(() => { localStorage.setItem(LS_BASE, JSON.stringify(baseline)); }, [baseline]);
+  useEffect(() => { localStorage.setItem(LS_COUNTS, JSON.stringify(counts)); }, [counts]);
+  useEffect(() => { localStorage.setItem(LS_VER, String(version)); versionRef.current = version; }, [version]);
+  useEffect(() => { localStorage.setItem(LS_SYNC, JSON.stringify({ url: sbUrl, key: sbKey, room: roomId })); }, [sbUrl, sbKey, roomId]);
+
+  // ---- helpers ----
+  const canMakeWith = (inv: Inventory, recipeKey: string) => {
+    const recipe = RECIPES[recipeKey];
+    const blockers: string[] = [];
+    for (const k in recipe) {
+      const need = recipe[k];
+      const have = inv[k as keyof Inventory] as number;
+      if (have < need) blockers.push(NICE_LABEL[k] || k);
+    }
+    return { ok: blockers.length === 0, blockers };
+  };
+  const canMake = (recipeKey: string) => canMakeWith(inventory, recipeKey);
+
+  const servingsLeftWith = (inv: Inventory, recipeKey: string) => {
+    const recipe = RECIPES[recipeKey];
+    let min = Infinity;
+    for (const k in recipe) {
+      const need = recipe[k];
+      const have = inv[k as keyof Inventory] as number;
+      const left = Math.floor(have / need);
+      if (left < min) min = left;
+    }
+    return isFinite(min) ? min : 0;
+  };
+
+  const updateBaselineIfIncreased = (key: keyof Inventory, nextVal: number) => {
+    setBaseline((prev: Baseline) => ({ ...prev, [key]: Math.max((prev as any)[key] ?? 0, nextVal) } as Baseline));
+  };
+
+  // ---- actions ----
+  const makeOne = (recipeKey: string) => {
+    localDirtyRef.current = true;
+    const check = canMake(recipeKey);
+    if (!check.ok || actionsBlocked()) return;
+    const recipe = RECIPES[recipeKey];
+    setInventory((prev: Inventory) => {
+      const next: Inventory = { ...prev } as Inventory;
+      for (const k in recipe) (next as any)[k] = Math.max(0, (next as any)[k] as number - recipe[k]);
+      return next;
+    });
+    setCounts((prev: Counts) => ({ ...prev, [recipeKey]: (prev[recipeKey] || 0) + 1 }));
+  };
+
+  const undoOne = (recipeKey: string) => {
+    localDirtyRef.current = true;
+    if (actionsBlocked()) return;
+    setCounts((prev: Counts) => { const cur = prev[recipeKey] || 0; if (cur <= 0) return prev; return { ...prev, [recipeKey]: cur - 1 }; });
+    const recipe = RECIPES[recipeKey];
+    setInventory((prev: Inventory) => {
+      const next: Inventory = { ...prev } as Inventory;
+      for (const k in recipe) (next as any)[k] = Math.max(0, (next as any)[k] as number + recipe[k]);
+      return next;
+    });
+  };
+
+  const resetAll = () => {
+    localDirtyRef.current = true;
+    if (actionsBlocked()) return;
+    setInventory(INITIAL_INVENTORY);
+    setBaseline(INITIAL_INVENTORY);
+    const o: Counts = {}; (Object.keys(RECIPES) as string[]).forEach((k) => (o[k] = 0)); setCounts(o);
+  };
+
+  const setInventoryValue = (key: keyof Inventory, value: number) => {
+    localDirtyRef.current = true;
+    if (actionsBlocked()) return;
+    const v = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+    setInventory((prev: Inventory) => ({ ...prev, [key]: v } as Inventory));
+    updateBaselineIfIncreased(key, v);
+  };
+  const bumpInventory = (key: keyof Inventory, delta: number) => {
+    localDirtyRef.current = true;
+    if (actionsBlocked()) return;
+    setInventory((prev: Inventory) => {
+      const nextVal = Math.max(0, (prev[key] as number) + delta);
+      const next: Inventory = { ...prev, [key]: nextVal } as Inventory;
+      updateBaselineIfIncreased(key, nextVal);
+      return next;
+    });
+  };
+
+  // ---- derived ----
+  const inventoryList = useMemo<{ key: string; label: string; value: number }[]>(
+    () => Object.entries(inventory).map(([k, v]) => ({ key: k, label: NICE_LABEL[k as keyof typeof NICE_LABEL] || k, value: v as number })),
+    [inventory]
+  );
+
+  const getLevel = (key: keyof Inventory, value: number) => {
+    const base = (baseline as any)[key] as number | undefined;
+    if (!Number.isFinite(base) || (base as number) <= 0) return "ok";
+    const pct = value / (base as number);
+    if (pct <= 0.15) return "danger";
+    if (pct <= 0.35) return "warn";
+    return "ok";
+  };
+
+  const leftMap = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const key of (Object.keys(RECIPES) as string[])) out[key] = servingsLeftWith(inventory as Inventory, key);
+    return out;
+  }, [inventory]);
+
+  // 1杯原価はシート値を最優先。無い場合のみ材料単価から算出。
   const perCupCost = useMemo(() => {
-    // シート値を優先、無い時のみ原材料から算出
     const map: Record<string, number> = {};
     for (const key of (Object.keys(RECIPES) as string[])) {
-      if ((PER_RECIPE_COSTS as any)[key] != null) {
-        map[key] = Math.round((PER_RECIPE_COSTS as any)[key] * 10) / 10;
+      if (PER_RECIPE_COSTS[key] != null) {
+        map[key] = Math.round(PER_RECIPE_COSTS[key] * 10) / 10;
         continue;
       }
       const recipe = RECIPES[key]; let cost = 0;
       for (const mat in recipe) {
-        const amt = (recipe as any)[mat];
-        cost += (mat === "peach_pieces") ? (PEACH_GARNISH_COST * amt) : (((UNIT_COSTS as any)[mat] || 0) * amt);
+        const amt = recipe[mat];
+        cost += (mat === "peach_pieces") ? (PEACH_GARNISH_COST * amt) : ((UNIT_COSTS as any)[mat] || 0) * amt;
       }
       map[key] = Math.round(cost * 10) / 10;
     }
@@ -222,101 +338,165 @@ export default function App() {
     return { cups, revenue, cogs: Math.round(cogs), gp: Math.round(gp), margin };
   }, [counts, perCupCost]);
 
-  // ==== 在庫操作 ====
-  const makeOne = (name: string) => {
-    const ok = canMakeWith(inventory, name).ok; if (!ok) return;
-    setInventory((inv) => subInv(inv, RECIPES[name], 1));
-    setCounts((m) => ({ ...m, [name]: (m[name] || 0) + 1 }));
-  };
-  const undoOne = (name: string) => {
-    if (!counts[name]) return;
-    setInventory((inv) => addInv(inv, RECIPES[name], 1));
-    setCounts((m) => ({ ...m, [name]: Math.max(0, (m[name] || 0) - 1) }));
-  };
+  // ====== ソフトロック付き同期 ======
+  const clientId = useRef<string>(ensureClientId());
+  const pushingRef = useRef(false);
 
-  const resetAll = () => {
-    setInventory({ ...baseline });
-    setCounts({});
+  type RemotePayload = {
+    inventory: Inventory;
+    baseline: Baseline;
+    counts: Counts;
+    version: number;
+    updated_at: string;
+    // soft lock
+    sync?: { busy: boolean; owner: string; started_at: number };
   };
 
-  // ==== 最大杯数 ====
-  const maxServings = useMemo(() => {
-    const map: Record<string, number> = {};
-    for (const k of Object.keys(RECIPES)) map[k] = servingsLeftWith(inventory, k);
-    return map;
-  }, [inventory]);
+  const buildPayload = (partial?: Partial<RemotePayload>): RemotePayload => ({
+    inventory, baseline, counts, version,
+    updated_at: new Date().toISOString(),
+    sync: { busy: false, owner: clientId.current, started_at: Date.now() },
+    ...(partial || {}),
+  });
 
-  // ====== 簡易同期（ソフトロック） ======
-  const startSync = async () => {
-    if (!roomId || !sbUrl || !sbKey) return;
-    const cid = ensureClientId();
-    syncOwner.current = cid;
-    setSyncing(true);
-    const ok = await pushToServer(cid);
-    if (!ok) { setSyncing(false); syncOwner.current = null; }
-  };
-
-  const stopSync = () => {
-    setSyncing(false);
-    syncOwner.current = null;
-  };
-
-  async function getSupabase() {
-    const createClient = await lazyImportSupabaseCreateClient();
-    if (!createClient) return null;
-    return createClient(sbUrl, sbKey, { auth: { autoRefreshToken: true, persistSession: false } });
-  }
-
-  async function pushToServer(owner: string) {
-    try {
-      const sb = await getSupabase(); if (!sb) return false;
-      const payload = { inventory, baseline, counts, owner, at: Date.now() };
-      await sb.from('mt_rooms').upsert({ id: roomId, payload }).throwOnError();
-      return true;
-    } catch { return false; }
-  }
-
-  async function pullFromServer() {
-    try {
-      const sb = await getSupabase(); if (!sb) return false;
-      const { data } = await sb.from('mt_rooms').select('payload').eq('id', roomId).single();
-      if (data?.payload) {
-        if (syncOwner.current && data.payload.owner === syncOwner.current) {
-          // 自分が直近オーナー → ローカルをサーバ準拠にしてロック解除
-          setInventory(data.payload.inventory);
-          setBaseline(data.payload.baseline);
-          setCounts(data.payload.counts);
-          setSyncing(false);
-          syncOwner.current = null;
-        } else {
-          // 他端末の更新を取り込む
-          setInventory(data.payload.inventory);
-          setBaseline(data.payload.baseline);
-          setCounts(data.payload.counts);
-        }
-        return true;
-      }
-      return false;
-    } catch { return false; }
-  }
-
-  // サーバの変更ポーリング
-  useEffect(() => {
-    if (!connected || !roomId) return;
-    const t = setInterval(() => { pullFromServer(); }, 2000);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connected, roomId]);
-
-  // 接続・切断
-  const connectSupabase = async () => {
-    const sb = await getSupabase(); if (!sb) return false;
-    setConnected(true);
-    return true;
-  };
-  const disconnectSupabase = () => {
+  const clearAutoConn = () => {
+    try { localStorage.removeItem(LS_AUTOCONN); } catch {}
     setConnected(false);
   };
+
+  const setAutoConnOn = () => {
+    try { localStorage.setItem(LS_AUTOCONN, '1'); } catch {}
+  };
+
+  const connectSupabase = async (): Promise<boolean> => {
+    try {
+      const cc = await loadSupabase();
+      if (!cc) {
+        alert(`supabase-js が見つかりません。\nnpm i @supabase/supabase-js を実行してください。`);
+        clearAutoConn();
+        return false;
+      }
+      if (!sbUrl || !sbKey || !roomId) {
+        alert('Supabase URL / anon key / Room ID を入力してください');
+        clearAutoConn();
+        return false;
+      }
+
+      const sb = cc(sbUrl, sbKey);
+      supabaseRef.current = sb;
+      setConnected(true);
+      startSync('接続中…');
+
+      const { data: got, error: selErr } = await sb.from('rooms').select('id,payload').eq('id', roomId).maybeSingle();
+      if (selErr) {
+        console.error(selErr);
+      }
+      if (got && (got as any).payload) {
+        const remote = (got as any).payload as RemotePayload;
+        const remoteVer = Number(remote?.version || 0);
+        if (remoteVer > version) {
+          setInventory(remote.inventory); setBaseline(remote.baseline); setCounts(remote.counts); setVersion(remoteVer);
+        }
+      } else {
+        const { error: upErr } = await sb.from('rooms').upsert({ id: roomId, payload: buildPayload() }, { onConflict: 'id' });
+        if (upErr) throw upErr;
+      }
+
+      // Realtime 購読（ページリロードせずに反映）
+      if (subscriptionRef.current) sb.removeChannel(subscriptionRef.current);
+      const handler = (ev: any) => {
+        try {
+          const remote = ev?.new?.payload as RemotePayload;
+          if (!remote) return;
+          // ロック情報を更新（他端末が busy の間のみ操作ブロック）
+          const busy = !!remote?.sync?.busy;
+          const owner = remote?.sync?.owner;
+          const started = Number(remote?.sync?.started_at || 0);
+          if (busy && owner && owner !== clientId.current) {
+            // 同じownerの古い busy 通知は無視してTTLを延長しすぎない
+            const isNewBusy = owner !== lastBusyOwnerRef.current || started > lastBusyStartedRef.current;
+            if (isNewBusy) {
+              lastBusyOwnerRef.current = owner;
+              lastBusyStartedRef.current = started;
+              const until = started + LOCK_TTL_MS;
+              if (until > Date.now()) markLockedUntil(until);
+            }
+          }
+
+          const remoteVer = Number(remote?.version || 0);
+          if (pushingRef.current) return; // 自分の反射は無視
+          if (remoteVer <= Number(versionRef.current || 0)) return; // 古い/同一バージョンはスキップ
+
+          // ページリロードはせず、静かに適用（デバウンス）
+          if (applyTimerRef.current) clearTimeout(applyTimerRef.current);
+          applyTimerRef.current = setTimeout(() => {
+            // リモート適用フラグを立てて push を抑止
+            remoteApplyingRef.current = true;
+            setInventory(remote.inventory);
+            setBaseline(remote.baseline);
+            setCounts(remote.counts);
+            setVersion(remoteVer);
+          }, 100);
+        } catch { /* noop */ }
+      };
+      const channel = sb
+        .channel(`rooms:${roomId}`)
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, handler)
+        .subscribe();
+      subscriptionRef.current = channel;
+
+      // 成功したので自動再接続フラグ ON
+      setAutoConnOn();
+      finishSync();
+      return true;
+    } catch (e) {
+      console.error(e);
+      clearAutoConn();
+      return false;
+    }
+  };
+
+  // 変更時 push（ソフトロック: 送信前に busy=true を広報 → 最終状態を busy=false で確定）
+  useEffect(() => {
+    const push = async () => {
+      if (!connected || !supabaseRef.current || !roomId) return;
+      // リモート適用直後の反射は無視（ループ抑止）
+      if (remoteApplyingRef.current) { remoteApplyingRef.current = false; return; }
+      // ローカル操作が無いなら push しない（反映時の無限再送抑止）
+      if (!localDirtyRef.current) return;
+
+      const sb = supabaseRef.current;
+
+      // 直近のリモートを確認。誰かが busy(true) なら、TTL内は自分の送信を少し遅らせる（リトライ）
+      const { data } = await sb.from('rooms').select('payload').eq('id', roomId).maybeSingle();
+      const remote = data?.payload as RemotePayload | undefined;
+      if (remote?.sync?.busy && remote.sync.owner !== clientId.current) {
+        const started = Number(remote.sync.started_at || 0);
+        const until = started + LOCK_TTL_MS;
+        const delay = Math.max(0, until - Date.now()) + 200;
+        markLockedUntil(until);
+        setTimeout(push, delay);
+        return;
+      }
+
+      // 自分がロック告知
+      const announce = buildPayload({ sync: { busy: true, owner: clientId.current, started_at: Date.now() } });
+      pushingRef.current = true;
+      startSync('同期中…');
+      await sb.from('rooms').upsert({ id: roomId, payload: announce }, { onConflict: 'id' });
+
+      // 最終状態をコミット（busy=false）
+      const nextVersion = Number(version) + 1;
+      const finalPayload = buildPayload({ version: nextVersion, sync: { busy: false, owner: clientId.current, started_at: Date.now() } });
+      await sb.from('rooms').upsert({ id: roomId, payload: finalPayload }, { onConflict: 'id' });
+      setVersion(nextVersion);
+      localDirtyRef.current = false; // ローカル変更を消化
+      setTimeout(() => { pushingRef.current = false; finishSync(); }, 120);
+    };
+    push();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [inventory, baseline, counts]);
 
   // 自動再接続: マウント時にフラグと資格情報を確認
   useEffect(() => {
@@ -340,16 +520,14 @@ export default function App() {
     const results: { name: string; pass: boolean; got: any; expected: any }[] = [];
     const eq = (name: string, got: any, expected: any) => results.push({ name, pass: Object.is(got, expected), got, expected });
 
-    // 既存ケース
+    // 既存ケース（シート在庫でも一致）
     eq("白桃さっぱり max", servingsLeftWith(INITIAL_INVENTORY as any, "白桃スカッシュ / さっぱり"), 40);
     eq("モヒート甘め max", servingsLeftWith(INITIAL_INVENTORY as any, "パインモヒート / 甘め"), 35);
     eq("トロピカルすっきり max", servingsLeftWith(INITIAL_INVENTORY as any, "トロピカルスカッシュ / すっきり"), 30);
     const invNoPeach = { ...INITIAL_INVENTORY, peach_pieces: 0 } as typeof INITIAL_INVENTORY;
     eq("白桃トッピング不足検出", canMakeWith(invNoPeach as Inventory, "白桃スカッシュ / さっぱり").ok, false);
-    const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY;
-    eq("トロピカルすっきり ほぼ尽きる", servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"), 1);
-    const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY;
-    eq("トロピカルすっきり 少し増える", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
+    const invFewSoda = { ...INITIAL_INVENTORY, soda_tropical: 110 } as typeof INITIAL_INVENTORY; eq("トロピカル 1杯", servingsLeftWith(invFewSoda as Inventory, "トロピカルスカッシュ / すっきり"), 1);
+    const invMoreSoda = { ...invFewSoda, soda_tropical: 220 } as typeof INITIAL_INVENTORY; eq("トロピカル 2杯", servingsLeftWith(invMoreSoda as Inventory, "トロピカルスカッシュ / すっきり"), 2);
     const afterOne = { ...INITIAL_INVENTORY, white_peach_syrup: INITIAL_INVENTORY.white_peach_syrup - 20, soda_white: INITIAL_INVENTORY.soda_white - 120, peach_pieces: INITIAL_INVENTORY.peach_pieces - 1 } as typeof INITIAL_INVENTORY;
     eq("白桃さっぱり 1杯後 max", servingsLeftWith(afterOne as any, "白桃スカッシュ / さっぱり"), 39);
 
@@ -359,7 +537,7 @@ export default function App() {
     const invLackSoda = { ...INITIAL_INVENTORY, soda_white: 119 } as typeof INITIAL_INVENTORY;
     eq("白桃さっぱり soda不足で作れない", canMakeWith(invLackSoda as Inventory, "白桃スカッシュ / さっぱり").ok, false);
 
-    // 追加ケース: 1杯原価はシート値に一致
+    // 追加ケース: 1杯原価（白桃さっぱり）はシート値に一致
     eq("1杯原価(白桃さっぱり)=109.4", (perCupCost as any)["白桃スカッシュ / さっぱり"], 109.4);
 
     // eslint-disable-next-line no-console
@@ -373,110 +551,167 @@ export default function App() {
         <header className="flex items-start justify-between gap-4 mb-6">
           <div>
             <h1 className="text-2xl font-bold">モクテル在庫トラッカー</h1>
-            <p className="text-sm text-neutral-600">在庫を減算・補充して各端末で同期。Room ID を共有すると複数端末で同じ在庫を見られます</p>
+            <p className="text-sm text-neutral-600">在庫を減算・補充して各端末で同期。Room ID を共有すると複数端末で同じ在庫を見られます。</p>
+            <p className="text-xs text-neutral-500 mt-1">※トロピカルは <span className="font-semibold">冷凍マンゴー/冷凍パインを原価・在庫計算から除外</span>。モヒートは <span className="font-semibold">ライムを除外</span>。</p>
           </div>
-
-          <div className="flex flex-col gap-2 items-end">
-            <div className="flex gap-2">
-              <input className="border rounded px-2 py-1 text-sm" placeholder="Supabase URL" value={sbUrl} onChange={e => setSbUrl(e.target.value)} style={{ width: 180 }} />
-              <input className="border rounded px-2 py-1 text-sm" placeholder="Supabase Key" value={sbKey} onChange={e => setSbKey(e.target.value)} style={{ width: 180 }} />
-              <input className="border rounded px-2 py-1 text-sm" placeholder="Room ID" value={roomId} onChange={e => setRoomId(e.target.value)} style={{ width: 120 }} />
-            </div>
-            <div className="flex gap-2">
-              {!connected ? (
-                <button className="px-3 py-1 rounded bg-indigo-600 text-white text-sm" onClick={() => { connectSupabase(); setConnected(true); setAutoConn(); }}>接続</button>
-              ) : (
-                <button className="px-3 py-1 rounded bg-neutral-200 text-neutral-800 text-sm" onClick={() => { disconnectSupabase(); clearAutoConn(); }}>切断</button>
-              )}
-              {!syncing ? (
-                <button disabled={!connected || !roomId} className="px-3 py-1 rounded bg-emerald-600 disabled:bg-neutral-300 text-white text-sm" onClick={startSync}>サーバへ送信</button>
-              ) : (
-                <button className="px-3 py-1 rounded bg-orange-500 text-white text-sm" onClick={stopSync}>同期中…（解除）</button>
-              )}
-            </div>
+          <div className="flex items-center gap-2">
+            <button onClick={() => setEditMode((v) => !v)} className={`px-4 py-2 rounded-2xl shadow ${editMode ? "bg-amber-600 hover:bg-amber-700 text-white" : "bg-white hover:bg-neutral-100 text-neutral-900"}`}>{editMode ? "在庫編集: ON" : "在庫編集: OFF"}</button>
+            <button onClick={reloadWithScrollSave} className="px-3 py-2 rounded-2xl bg-white hover:bg-neutral-100 text-neutral-900 border border-neutral-200 shadow" title="ページを再読み込み">再読み込み</button>
+            <button onClick={resetAll} className="px-4 py-2 rounded-2xl bg-neutral-900 text-white hover:bg-neutral-800 shadow" disabled={actionsBlocked()}>リセット</button>
           </div>
         </header>
 
-        <section className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
-          <div className="bg-white rounded-xl shadow p-4">
-            <h2 className="font-semibold mb-2">サマリー</h2>
-            <div className="space-y-1 text-sm">
-              <div>提供杯数: <span className="font-mono">{totals.cups}</span> 杯</div>
-              <div>売上: <span className="font-mono">{totals.revenue.toLocaleString()}</span> 円</div>
-              <div>原価: <span className="font-mono">{totals.cogs.toLocaleString()}</span> 円</div>
-              <div>粗利: <span className="font-mono">{totals.gp.toLocaleString()}</span> 円</div>
-              <div>原価率: <span className="font-mono">{(totals.revenue > 0 ? (totals.cogs / totals.revenue) * 100 : 0).toFixed(1)}%</span></div>
-            </div>
-            <div className="mt-3 flex gap-2">
-              <button className="px-3 py-1 rounded bg-neutral-200 text-neutral-800 text-sm" onClick={resetAll}>在庫と杯数をリセット</button>
-            </div>
+        {/* 同期設定 */}
+        <section className="mb-6">
+          <div className="bg-white rounded-2xl shadow p-4 grid md:grid-cols-4 gap-2 text-sm">
+            <input className="px-2 py-2 rounded border" placeholder="Supabase URL" value={sbUrl} onChange={(e) => setSbUrl(e.target.value)} />
+            <input className="px-2 py-2 rounded border" placeholder="Supabase anon key" value={sbKey} onChange={(e) => setSbKey(e.target.value)} />
+            <input className="px-2 py-2 rounded border" placeholder="Room ID（英数・長め推奨）" value={roomId} onChange={(e) => setRoomId(e.target.value)} />
+            <button className={`px-4 py-2 rounded ${connected ? 'bg-emerald-600 text-white' : 'bg-neutral-900 text-white'}`} onClick={connectSupabase}>{connected ? '接続中' : '接続'}</button>
           </div>
+          <p className="text-xs text-neutral-500 mt-1">※ だれかが送信を開始すると全端末で「同期中」表示になり、完了で解除されます（ソフトロック）。</p>
+        </section>
 
-          <div className="bg-white rounded-xl shadow p-4 md:col-span-2">
-            <h2 className="font-semibold mb-2">在庫</h2>
-            <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm">
-              {Object.keys(INITIAL_INVENTORY).map((k) => (
-                <div key={k} className="flex items-center justify-between">
-                  <div className="text-neutral-700">{NICE_LABEL[k as keyof Inventory] || k}</div>
-                  <div className="flex items-center gap-2">
-                    <input type="number" className="border rounded px-2 py-1 w-28 text-right font-mono"
-                      value={(inventory as any)[k] ?? 0}
-                      onChange={e => setInventory(prev => ({ ...prev, [k]: Number(e.target.value || 0) }))}
-                    />
-                    <span className="text-neutral-500">{k === 'peach_pieces' ? '個' : 'ml'}</span>
-                  </div>
-                </div>
-              ))}
+        {/* 売上・原価サマリー */}
+        <section className="mb-6">
+          <div className="grid md:grid-cols-4 gap-2 text-sm">
+            <div className="bg-white rounded-xl p-3 shadow flex justify-between">
+              <span>売価(1杯)</span>
+              <span className="font-mono">¥{PRICE_PER_CUP}</span>
+            </div>
+            <div className="bg-white rounded-xl p-3 shadow flex justify-between">
+              <span>合計杯数</span>
+              <span className="font-mono">{totals.cups}</span>
+            </div>
+            <div className="bg-white rounded-xl p-3 shadow flex justify-between">
+              <span>売上</span>
+              <span className="font-mono">¥{totals.revenue}</span>
+            </div>
+            <div className="bg-white rounded-xl p-3 shadow flex justify-between">
+              <span>合計原価</span>
+              <span className="font-mono">¥{totals.cogs}</span>
             </div>
           </div>
         </section>
 
-        <section className="bg-white rounded-2xl shadow p-4 mb-6">
-          <h2 className="font-semibold mb-3">メニュー</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            {Object.keys(RECIPES).map((name) => {
-              const can = canMakeWith(inventory, name);
-              const n = counts[name] || 0;
+        {/* バリエーション一覧 */}
+        <section className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {(Object.keys(RECIPES) as string[]).map((key) => {
+            const { ok, blockers } = canMake(key);
+            const left = leftMap[key];
+            return (
+              <div key={key} className="bg-white rounded-2xl shadow p-4 flex flex-col gap-3">
+                <div>
+                  <h2 className="font-semibold text-lg">{key}</h2>
+                  <p className="text-xs text-neutral-500">作成数: <span className="font-mono">{counts[key] || 0}</span> / 可能: <span className="font-mono">{left}</span> 杯 / 1杯原価: <span className="font-mono">¥{perCupCost[key]}</span></p>
+                </div>
+
+                {/* 使用材料の明細 */}
+                <div className="text-xs bg-neutral-50 rounded-xl p-3">
+                  <p className="text-neutral-500 mb-1">1杯あたりの使用量</p>
+                  <ul className="grid grid-cols-2 gap-1">
+                    {(Object.entries(RECIPES[key]) as [string, number][])?.map(([ik, amount]) => (
+                      <li key={ik} className="flex items-center justify-between">
+                        <span>{NICE_LABEL[ik as keyof typeof NICE_LABEL] || ik}</span>
+                        <span className="font-mono">{amount}{ik === "peach_pieces" ? "個" : "ml"}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                {/* アクション */}
+                {(() => {
+                  const disabledMake = !ok || actionsBlocked();
+                  const disabledUndo = (counts[key] || 0) === 0 || actionsBlocked();
+                  return (
+                    <div className="mt-auto flex gap-2">
+                      <button
+                        onClick={() => makeOne(key)}
+                        disabled={disabledMake}
+                        className={`px-4 py-2 rounded-xl font-medium shadow transition ${disabledMake ? "bg-neutral-200 text-neutral-500 cursor-not-allowed" : "bg-emerald-600 hover:bg-emerald-700 text-white"}`}
+                      >
+                        1杯作る
+                      </button>
+                      <button
+                        onClick={() => undoOne(key)}
+                        disabled={disabledUndo}
+                        className={`px-4 py-2 rounded-xl font-medium shadow transition ${disabledUndo ? "bg-neutral-200 text-neutral-500 cursor-not-allowed" : "bg-red-600 hover:bg-red-700 text-white"}`}
+                        title="直前の誤操作などを取り消して1杯分を在庫に戻します"
+                      >
+                        1杯減らす
+                      </button>
+                    </div>
+                  );
+                })()}
+
+                {!ok && (<div className="text-xs text-red-600">在庫不足：{blockers.join("・")}</div>)}
+              </div>
+            );
+          })}
+        </section>
+
+        {/* 在庫サマリー */}
+        <section className="mt-8">
+          <h3 className="font-semibold mb-3">在庫（残量）</h3>
+          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {inventoryList.map(({ key, label, value }) => {
+              const isPieces = key === "peach_pieces";
+              const level = getLevel(key as keyof Inventory, value as number);
+              const base = (baseline as any)[key] ?? 0;
+              const pct = base > 0 ? Math.min(1, Math.max(0, (value as number) / base)) : 1;
+              const wrapCls = level === "danger" ? "border border-red-300 bg-red-50" : level === "warn" ? "border border-amber-300 bg-amber-50" : "border border-neutral-200 bg-white";
               return (
-                <div key={name} className="border rounded-xl p-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="font-medium">{name}</div>
-                    <div className="text-xs text-neutral-500">最大 <span className="font-mono">{maxServings[name]}</span> 杯</div>
+                <div key={key} className={`${wrapCls} rounded-xl p-3 shadow text-sm flex flex-col gap-2`}>
+                  <div className="flex items-center justify-between">
+                    <span>{label}</span>
+                    <span className={`font-mono ${level === "danger" ? "text-red-700" : level === "warn" ? "text-amber-700" : "text-neutral-900"}`}>{value}{isPieces ? "個" : "ml"}</span>
                   </div>
-                  <div className="mt-2 text-sm text-neutral-700">
-                    原価 <span className="font-mono">{(perCupCost[name] || 0).toFixed(1)}</span> 円 / 杯
-                    <span className="ml-3">原価率 <span className="font-mono">{((perCupCost[name] || 0) / PRICE_PER_CUP * 100).toFixed(1)}%</span></span>
-                  </div>
-                  <div className="mt-2 flex gap-2">
-                    <button className="px-3 py-1 rounded bg-indigo-600 text-white text-sm disabled:bg-neutral-300"
-                      disabled={!can.ok}
-                      onClick={() => makeOne(name)}
-                    >提供 +1</button>
-                    <button className="px-3 py-1 rounded bg-neutral-200 text-neutral-800 text-sm disabled:bg-neutral-100"
-                      disabled={!n}
-                      onClick={() => undoOne(name)}
-                    >取消 -1</button>
-                    <div className="ml-auto text-sm text-neutral-600">累計 <span className="font-mono">{n}</span> 杯</div>
-                  </div>
+                  {base > 0 && (
+                    <div className="h-2 w-full rounded bg-neutral-100 overflow-hidden">
+                      <div className={`${level === "danger" ? "bg-red-500" : level === "warn" ? "bg-amber-500" : "bg-emerald-500"} h-full`} style={{ width: `${pct * 100}%` }} aria-hidden />
+                    </div>
+                  )}
+                  {editMode && (
+                    <div className="flex items-center gap-2">
+                      <input type="number" inputMode="numeric" className="w-28 px-2 py-1 rounded border border-neutral-300 font-mono" value={value as number} onChange={(e) => setInventoryValue(key as keyof Inventory, Number(e.target.value))} />
+                      <div className="flex gap-1">
+                        {isPieces ? (
+                          <>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 1)}>+1</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 5)}>+5</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 10)}>+10</button>
+                          </>
+                        ) : (
+                          <>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 50)}>+50</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 100)}>+100</button>
+                            <button className="px-2 py-1 rounded bg-neutral-100 hover:bg-neutral-200" onClick={() => bumpInventory(key as keyof Inventory, 500)}>+500</button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}
           </div>
+          <p className="text-xs text-neutral-500 mt-2">※ 在庫を補充（手動編集/＋ボタン）した時点の値が新しい100%になります。作成/取り消しでは基準は更新されません。</p>
         </section>
 
-        <footer className="text-xs text-neutral-500 text-right pb-4">
-          v1 • ローカル保存 / 任意でSupabase同期（Room共有）
-        </footer>
+        {/* 中央の小さな同期ポップ */}
+        {syncBusy && (
+          <div className="fixed inset-0 pointer-events-none flex items-start justify-center">
+            <div className="mt-10 px-4 py-2 rounded-xl shadow bg-neutral-900/90 text-white text-sm flex items-center gap-2">
+              <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/>
+              </svg>
+              <span>{syncMsg || '同期中…'}</span>
+            </div>
+          </div>
+        )}
       </div>
-     </div>
-    </>
+    </div>
+   </>
   );
-}
-
-// 自動再接続 ON/OFF
-function setAutoConn() {
-  try { localStorage.setItem(LS_AUTOCONN, '1'); } catch {}
-}
-function clearAutoConn() {
-  try { localStorage.removeItem(LS_AUTOCONN); } catch {}
 }
