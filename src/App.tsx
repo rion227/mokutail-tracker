@@ -363,7 +363,7 @@ export default function App() {
     }
 
     // 実在庫・基準を更新（基準は「補充時に上書き」ルールを維持）
-    setInventory((prev) => {
+    setInventory(() => {
       const next = { ...(draftInventory as Inventory) };
       // baselineは「増えた項目のみ上書き」
       setBaseline((prevBase) => {
